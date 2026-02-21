@@ -145,6 +145,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
     let config = Config {
+        workspace_base: None,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: if api_key.is_empty() {
@@ -388,6 +389,7 @@ async fn run_quick_setup_with_home(
     let memory_config = memory_config_defaults_for_backend(&memory_backend_name);
 
     let config = Config {
+        workspace_base: None,
         workspace_dir: workspace_dir.clone(),
         config_path: config_path.clone(),
         api_key: credential_override.map(|c| {
