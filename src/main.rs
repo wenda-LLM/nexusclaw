@@ -369,6 +369,8 @@ Examples:
         peripheral_command: zeroclaw::PeripheralCommands,
     },
     Server {
+        #[arg(long, default_value = "0.0.0.0")]
+        host: String,
         #[arg(long, default_value = "3000")]
         port: u16,
     },
@@ -909,9 +911,9 @@ async fn main() -> Result<()> {
             peripherals::handle_command(peripheral_command.clone(), &config).await
         }
 
-        Commands::Server { port } => {
-            info!("Starting multi-tenant server on port {}", port);
-            zeroclaw::server::run_server(port, &config.workspace_dir).await?;
+        Commands::Server { host, port } => {
+            info!("Starting multi-tenant server on {}:{}", host, port);
+            zeroclaw::server::run_server(port, &host, &config.workspace_dir).await?;
             Ok(())
         }
 

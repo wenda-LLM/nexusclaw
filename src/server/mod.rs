@@ -1304,7 +1304,7 @@ async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> 
     })
 }
 
-pub async fn run_server(port: u16, data_dir: &std::path::Path) -> Result<()> {
+pub async fn run_server(port: u16, host: &str, data_dir: &std::path::Path) -> Result<()> {
     let users_store = UserStore::new(data_dir);
 
     let config = match Config::load_or_init().await {
@@ -1384,7 +1384,8 @@ pub async fn run_server(port: u16, data_dir: &std::path::Path) -> Result<()> {
         .fallback_service(static_service)
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], port));
+    let addr = format!("{}:{}", host, port);
+    let addr: SocketAddr = addr.parse()?;
     info!("Server running on http://{}", addr);
     let listener = tokio::net::TcpListener::bind(addr).await?;
 
