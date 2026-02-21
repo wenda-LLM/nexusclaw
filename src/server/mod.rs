@@ -1319,7 +1319,7 @@ pub async fn run_server(port: u16, data_dir: &std::path::Path) -> Result<()> {
     };
 
     let web_dist = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("web")
+        .join("multitenant-web")
         .join("dist");
 
     let web_dist_for_index = web_dist.clone();
