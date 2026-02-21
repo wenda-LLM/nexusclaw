@@ -153,6 +153,13 @@ pub struct Config {
     #[serde(default)]
     pub browser: BrowserConfig,
 
+    /// Hooks configuration (lifecycle hooks and built-in hook toggles).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+    /// Voice transcription configuration (Whisper API via Groq).
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
+
     /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     pub http_request: HttpRequestConfig,
@@ -856,6 +863,74 @@ impl Default for BrowserComputerUseConfig {
             window_allowlist: Vec::new(),
             max_coordinate_x: None,
             max_coordinate_y: None,
+        }
+    }
+}
+
+fn default_transcription_api_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".into()
+}
+
+fn default_transcription_model() -> String {
+    "whisper-large-v3".into()
+}
+
+fn default_transcription_max_duration_secs() -> u64 {
+    120
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "kebab-case")]
+pub struct TranscriptionConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_transcription_api_url")]
+    pub api_url: String,
+    #[serde(default = "default_transcription_model")]
+    pub model: String,
+    #[serde(default)]
+    pub language: Option<String>,
+    #[serde(default = "default_transcription_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_transcription_api_url(),
+            model: default_transcription_model(),
+            language: None,
+            max_duration_secs: default_transcription_max_duration_secs(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HooksConfig {
+    pub enabled: bool,
+    #[serde(default)]
+    pub builtin: BuiltinHooksConfig,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            builtin: BuiltinHooksConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuiltinHooksConfig {
+    pub command_logger: bool,
+}
+
+impl Default for BuiltinHooksConfig {
+    fn default() -> Self {
+        Self {
+            command_logger: false,
         }
     }
 }
@@ -1688,6 +1763,19 @@ pub struct ObservabilityConfig {
     /// Service name reported to the OTel collector. Defaults to "zeroclaw".
     #[serde(default)]
     pub otel_service_name: Option<String>,
+
+    /// Runtime trace storage mode: "none" | "rolling" | "full".
+    /// Controls whether model replies and tool-call diagnostics are persisted.
+    #[serde(default = "default_runtime_trace_mode")]
+    pub runtime_trace_mode: String,
+
+    /// Runtime trace file path. Relative paths are resolved under workspace_dir.
+    #[serde(default = "default_runtime_trace_path")]
+    pub runtime_trace_path: String,
+
+    /// Maximum number of runtime trace entries to retain in rolling mode.
+    #[serde(default = "default_runtime_trace_max_entries")]
+    pub runtime_trace_max_entries: usize,
 }
 
 impl Default for ObservabilityConfig {
@@ -1696,8 +1784,23 @@ impl Default for ObservabilityConfig {
             backend: "none".into(),
             otel_endpoint: None,
             otel_service_name: None,
+            runtime_trace_mode: default_runtime_trace_mode(),
+            runtime_trace_path: default_runtime_trace_path(),
+            runtime_trace_max_entries: default_runtime_trace_max_entries(),
         }
     }
+}
+
+fn default_runtime_trace_mode() -> String {
+    "none".into()
+}
+
+fn default_runtime_trace_path() -> String {
+    "runtime_trace.jsonl".into()
+}
+
+fn default_runtime_trace_max_entries() -> usize {
+    1000
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -1731,6 +1834,10 @@ pub struct AutonomyConfig {
     #[serde(default = "default_true")]
     pub block_high_risk_commands: bool,
 
+    /// Additional environment variables allowed for shell tool subprocesses.
+    #[serde(default)]
+    pub shell_env_passthrough: Vec<String>,
+
     /// Tools that never require approval (e.g. read-only tools).
     #[serde(default = "default_auto_approve")]
     pub auto_approve: Vec<String>,
@@ -1738,6 +1845,14 @@ pub struct AutonomyConfig {
     /// Tools that always require interactive approval, even after "Always".
     #[serde(default = "default_always_ask")]
     pub always_ask: Vec<String>,
+
+    /// Extra directory roots the agent may read/write outside the workspace.
+    #[serde(default)]
+    pub allowed_roots: Vec<String>,
+
+    /// Tools to exclude from non-CLI channels.
+    #[serde(default)]
+    pub non_cli_excluded_tools: Vec<String>,
 }
 
 fn default_auto_approve() -> Vec<String> {
@@ -1816,8 +1931,11 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
+            shell_env_passthrough: Vec::new(),
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
+            allowed_roots: Vec::new(),
+            non_cli_excluded_tools: Vec::new(),
         }
     }
 }
@@ -2309,6 +2427,9 @@ pub struct ChannelsConfig {
     pub dingtalk: Option<DingTalkConfig>,
     /// QQ Official Bot channel configuration.
     pub qq: Option<QQConfig>,
+    pub nostr: Option<NostrConfig>,
+    /// ClawdTalk voice channel configuration.
+    pub clawdtalk: Option<crate::channels::clawdtalk::ClawdTalkConfig>,
     /// Base timeout in seconds for processing a single channel message (LLM + tools).
     /// Runtime uses this as a per-turn budget that scales with tool-loop depth
     /// (up to 4x, capped) so one slow/retried model call does not consume the
@@ -2318,7 +2439,6 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
-}
 
 impl ChannelsConfig {
     /// get channels' metadata and `.is_some()`, except webhook
@@ -2430,6 +2550,8 @@ impl Default for ChannelsConfig {
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
+            clawdtalk: None,
             message_timeout_secs: default_channel_message_timeout_secs(),
         }
     }
@@ -3104,7 +3226,6 @@ pub fn default_nostr_relays() -> Vec<String> {
     ]
 }
 
->>>>>>> upstream/main
 // ── Config impl ──────────────────────────────────────────────────
 
 impl Default for Config {
@@ -3151,6 +3272,8 @@ impl Default for Config {
             agents: HashMap::new(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
+            hooks: HooksConfig::default(),
+            transcription: TranscriptionConfig::default(),
         }
     }
 }
@@ -3280,7 +3403,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     Ok(())
 }
 
-fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
+pub fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
         return (
@@ -3373,6 +3496,22 @@ async fn resolve_runtime_config_dirs(
         default_workspace_dir.to_path_buf(),
         ConfigResolutionSource::DefaultConfigDir,
     ))
+}
+
+pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+    let default_zeroclaw_dir = UserDirs::new()
+        .and_then(|dirs| dirs.home_dir().join(".zeroclaw").into_os_string().into())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
+
+    let default_workspace_dir = default_zeroclaw_dir.join("workspace");
+
+    let (_, workspace_dir, _) =
+        resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+
+    let (config_dir, _) = resolve_config_dir_for_workspace(&workspace_dir);
+
+    Ok((config_dir, workspace_dir))
 }
 
 fn decrypt_optional_secret(

@@ -26,6 +26,8 @@ const STREAM_CHUNK_MIN_CHARS: usize = 80;
 /// Used as a safe fallback when `max_tool_iterations` is unset or configured as zero.
 const DEFAULT_MAX_TOOL_ITERATIONS: usize = 10;
 
+pub(crate) const DRAFT_CLEAR_SENTINEL: &str = "\x00CLEAR\x00";
+
 /// Minimum user-message length (in chars) for auto-save to memory.
 /// Matches the channel-side constant in `channels/mod.rs`.
 const AUTOSAVE_MIN_MESSAGE_CHARS: usize = 20;
@@ -50,7 +52,7 @@ static SENSITIVE_KV_REGEX: LazyLock<Regex> = LazyLock::new(|| {
 /// Scrub credentials from tool output to prevent accidental exfiltration.
 /// Replaces known credential patterns with a redacted placeholder while preserving
 /// a small prefix for context.
-fn scrub_credentials(input: &str) -> String {
+pub fn scrub_credentials(input: &str) -> String {
     SENSITIVE_KV_REGEX
         .replace_all(input, |caps: &regex::Captures| {
             let full_match = &caps[0];
@@ -1259,6 +1261,8 @@ pub(crate) async fn run_tool_call_loop(
                         duration: llm_started_at.elapsed(),
                         success: true,
                         error_message: None,
+                        input_tokens: None,
+                        output_tokens: None,
                     });
 
                     let response_text = resp.text_or_empty().to_string();
@@ -1301,6 +1305,8 @@ pub(crate) async fn run_tool_call_loop(
                         duration: llm_started_at.elapsed(),
                         success: false,
                         error_message: Some(crate::providers::sanitize_api_error(&e.to_string())),
+                        input_tokens: None,
+                        output_tokens: None,
                     });
                     return Err(e);
                 }
