@@ -24,6 +24,7 @@ if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
     echo "docs_changed=false"
     echo "rust_changed=true"
     echo "workflow_changed=false"
+    echo "frontend_changed=false"
     echo "base_sha="
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
@@ -37,6 +38,7 @@ if [ -z "$CHANGED" ]; then
     echo "docs_changed=false"
     echo "rust_changed=false"
     echo "workflow_changed=false"
+    echo "frontend_changed=false"
     echo "base_sha=$BASE"
   } >> "$GITHUB_OUTPUT"
   write_empty_docs_files
@@ -47,6 +49,7 @@ docs_only=true
 docs_changed=false
 rust_changed=false
 workflow_changed=false
+frontend_changed=false
 docs_files=()
 while IFS= read -r file; do
   [ -z "$file" ] && continue
@@ -81,6 +84,10 @@ while IFS= read -r file; do
     || [[ "$file" == "deny.toml" ]]; then
     rust_changed=true
   fi
+
+  if [[ "$file" == web/* ]]; then
+    frontend_changed=true
+  fi
 done <<< "$CHANGED"
 
 {
@@ -88,6 +95,7 @@ done <<< "$CHANGED"
   echo "docs_changed=$docs_changed"
   echo "rust_changed=$rust_changed"
   echo "workflow_changed=$workflow_changed"
+  echo "frontend_changed=$frontend_changed"
   echo "base_sha=$BASE"
   echo "docs_files<<EOF"
   printf '%s\n' "${docs_files[@]}"

@@ -30,6 +30,7 @@ jobs:
         runs-on: ubuntu-latest
         outputs:
             rust_changed: ${{ steps.scope.outputs.rust_changed }}
+            frontend_changed: ${{ steps.scope.outputs.frontend_changed }}
             docs_only: ${{ steps.scope.outputs.docs_only }}
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -83,3 +84,26 @@ jobs:
                     CARGO_SLICER_VIRTUAL=1 CARGO_SLICER_CODEGEN_FILTER=1 \
                     RUSTC_WRAPPER=$(which cargo_slicer_dispatch) \
                     cargo +nightly build --release --verbose
+
+    build-frontend:
+        name: Build Frontend
+        needs: [changes]
+        if: needs.changes.outputs.frontend_changed == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+            - uses: actions/setup-node@b39d52d523719c29c5d7a11f3c86f2f9a8e5ded7 # v4
+              with:
+                  node-version: '20'
+                  cache: 'npm'
+                  cache-dependency-path: web/package-lock.json
+
+            - name: Install dependencies
+              run: npm ci
+              working-directory: web
+
+            - name: Build frontend
+              run: npm run build
+              working-directory: web
