@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="zeroclaw.png" alt="NexusClaw" width="200" />
+  <img src="nexusclaw.png" alt="NexusClaw" width="200" />
 </p>
 
 <h1 align="center">NexusClaw 🦀</h1>
