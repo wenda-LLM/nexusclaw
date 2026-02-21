@@ -290,6 +290,7 @@ pub struct AppState {
     pub nextcloud_talk_webhook_secret: Option<Arc<str>>,
     /// Observability backend for metrics scraping
     pub observer: Arc<dyn crate::observability::Observer>,
+    pub tools_registry: Arc<Vec<Box<dyn crate::tools::Tool>>>,
 }
 
 /// Run the HTTP gateway using axum with proper HTTP/1.1 compliance.
@@ -350,7 +351,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         (None, None)
     };
 
-    let _tools_registry = Arc::new(tools::all_tools_with_runtime(
+    let tools_registry = Arc::new(tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
         runtime,
@@ -364,6 +365,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         config.api_key.as_deref(),
         &config,
     ));
+
     // Extract webhook secret for authentication
     let webhook_secret_hash: Option<Arc<str>> =
         config.channels_config.webhook.as_ref().and_then(|webhook| {
@@ -568,6 +570,7 @@ pub async fn run_gateway(host: &str, port: u16, config: Config) -> Result<()> {
         nextcloud_talk: nextcloud_talk_channel,
         nextcloud_talk_webhook_secret,
         observer,
+        tools_registry,
     };
 
     // Build router with middleware
