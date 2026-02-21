@@ -74,9 +74,13 @@ mod peripherals;
 mod providers;
 mod runtime;
 mod security;
+mod server;
 mod service;
 mod skillforge;
 mod skills;
+mod tenant {
+    pub use zeroclaw::tenant::*;
+}
 mod tools;
 mod tunnel;
 mod util;
@@ -361,6 +365,10 @@ Examples:
     Peripheral {
         #[command(subcommand)]
         peripheral_command: zeroclaw::PeripheralCommands,
+    },
+    Server {
+        #[arg(long, default_value = "3000")]
+        port: u16,
     },
 
     /// Manage agent memory (list, get, stats, clear)
@@ -874,6 +882,12 @@ async fn main() -> Result<()> {
 
         Commands::Peripheral { peripheral_command } => {
             peripherals::handle_command(peripheral_command.clone(), &config).await
+        }
+
+        Commands::Server { port } => {
+            info!("Starting multi-tenant server on port {}", port);
+            zeroclaw::server::run_server(port, &config.workspace_dir).await?;
+            Ok(())
         }
 
         Commands::Config { config_command } => match config_command {

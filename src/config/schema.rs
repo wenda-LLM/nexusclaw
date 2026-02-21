@@ -54,7 +54,8 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
-    /// Workspace directory - computed from home, not serialized
+    #[serde(default)]
+    pub workspace_base: Option<PathBuf>,
     #[serde(skip)]
     pub workspace_dir: PathBuf,
     /// Path to config.toml - computed from home, not serialized
@@ -709,7 +710,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    3000
+    18789
 }
 
 fn default_gateway_host() -> String {
@@ -2813,6 +2814,7 @@ impl Default for Config {
         let zeroclaw_dir = home.join(".zeroclaw");
 
         Self {
+            workspace_base: None,
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
@@ -3144,6 +3146,13 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 }
 
 impl Config {
+    pub fn tenant_workspace_dir(&self, tenant_id: &str) -> PathBuf {
+        if let Some(ref base) = self.workspace_base {
+            return base.join(tenant_id);
+        }
+        self.workspace_dir.clone()
+    }
+
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
