@@ -143,25 +143,40 @@ The built-in web UI provides:
 
 ## Architecture
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                     NexusClaw Platform                       │
-├─────────────────────────────────────────────────────────────┤
-│  ┌─────────────────┐    ┌─────────────────┐                 │
-│  │   Web Server    │    │   CLI / Gateway │                 │
-│  │  (axum-based)   │    │   (ZeroClaw)    │                 │
-│  └────────┬────────┘    └────────┬────────┘                 │
-│           │                      │                          │
-│  ┌────────▼──────────────────────▼────────┐                │
-│  │           Multi-Tenant Layer            │                │
-│  │  Tenant | User | Group | Vault | Container│              │
-│  └─────────────────────────────────────────┘                │
-│                         │                                    │
-│  ┌──────────────────────▼──────────────────┐                │
-│  │          ZeroClaw Core Runtime           │                │
-│  │  Provider | Channel | Tool | Memory     │                │
-│  └─────────────────────────────────────────┘                │
-└─────────────────────────────────────────────────────────────┘
+```mermaid
+graph TB
+    subgraph "NexusClaw Platform"
+        subgraph "Presentation Layer"
+            WS[Web Server<br/>axum-based]
+            CG[CLI / Gateway<br/>ZeroClaw]
+        end
+        
+        subgraph "Multi-Tenant Layer"
+            TM[Tenant Manager]
+            UM[User Manager]
+            GM[Group Manager]
+            VM[Vault Manager]
+            CM[Container Manager]
+        end
+        
+        subgraph "ZeroClaw Core"
+            P[Provider]
+            C[Channel]
+            T[Tool]
+            M[Memory]
+        end
+    end
+    
+    WS --> TM
+    CG --> TM
+    TM --> P
+    TM --> C
+    TM --> T
+    TM --> M
+    UM --> TM
+    GM --> TM
+    VM --> TM
+    CM --> TM
 ```
 
 ## Configuration
