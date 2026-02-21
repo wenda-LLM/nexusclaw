@@ -50,13 +50,13 @@
 
 | 日付 (UTC) | レベル | お知らせ | 対応 |
 |---|---|---|---|
-| 2026-02-19 | _緊急_ | 私たちは `openagen/zeroclaw` および `zeroclaw.org` とは**一切関係ありません**。`zeroclaw.org` は現在 `openagen/zeroclaw` の fork を指しており、そのドメイン/リポジトリは当プロジェクトの公式サイト・公式プロジェクトを装っています。 | これらの情報源による案内、バイナリ、資金調達情報、公式発表は信頼しないでください。必ず本リポジトリと認証済み公式SNSのみを参照してください。 |
-| 2026-02-19 | _重要_ | 公式サイトは**まだ公開しておらず**、なりすましの試みを確認しています。ZeroClaw 名義の投資・資金調達などの活動には参加しないでください。 | 情報は本リポジトリを最優先で確認し、[X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Telegram CN（@zeroclawlabs_cn）](https://t.me/zeroclawlabs_cn)、[Telegram RU（@zeroclawlabs_ru）](https://t.me/zeroclawlabs_ru) と [小紅書アカウント](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) で公式更新を確認してください。 |
+| 2026-02-19 | _緊急_ | 私たちは `openagen/zeroclaw` および `zeroclaw.org` とは**一切関係ありません**。`zeroclaw.org` は現在 `openagen/zeroclaw` の fork を指しており、そのドメイン/リポジトリは当プロジェクトの公式サイト・公式プロジェクトを装っています。 | これらの情報源による案内、バイナリ、資金調達情報、公式発表は信頼しないでください。必ず[本リポジトリ](https://github.com/zeroclaw-labs/zeroclaw)と認証済み公式SNSのみを参照してください。 |
+| 2026-02-21 | _重要_ | 公式サイトを公開しました: [zeroclawlabs.ai](https://zeroclawlabs.ai)。公開までお待ちいただきありがとうございました。引き続きなりすましの試みを確認しているため、ZeroClaw 名義の投資・資金調達などの案内は、公式チャネルで確認できない限り参加しないでください。 | 情報は[本リポジトリ](https://github.com/zeroclaw-labs/zeroclaw)を最優先で確認し、[X（@zeroclawlabs）](https://x.com/zeroclawlabs?s=21)、[Reddit（r/zeroclawlabs）](https://www.reddit.com/r/zeroclawlabs/)、[Telegram（@zeroclawlabs）](https://t.me/zeroclawlabs)、[Telegram CN（@zeroclawlabs_cn）](https://t.me/zeroclawlabs_cn)、[Telegram RU（@zeroclawlabs_ru）](https://t.me/zeroclawlabs_ru) と [小紅書アカウント](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) で公式更新を確認してください。 |
 | 2026-02-19 | _重要_ | Anthropic は 2026-02-19 に Authentication and Credential Use を更新しました。条文では、OAuth authentication（Free/Pro/Max）は Claude Code と Claude.ai 専用であり、Claude Free/Pro/Max で取得した OAuth トークンを他の製品・ツール・サービス（Agent SDK を含む）で使用することは許可されず、Consumer Terms of Service 違反に該当すると明記されています。 | 損失回避のため、当面は Claude Code OAuth 連携を試さないでください。原文: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use)。 |
 
 ## 概要
 
-ZeroClaw は、高速・省リソース・高拡張性を重視した自律エージェント実行基盤です。
+ZeroClaw は、高速・省リソース・高拡張性を重視した自律エージェント実行基盤です。ZeroClawはエージェントワークフローのための**ランタイムオペレーティングシステム**です — モデル、ツール、メモリ、実行を抽象化し、エージェントを一度構築すればどこでも実行できるインフラストラクチャです。
 
 - Rust ネイティブ実装、単一バイナリで配布可能
 - Trait ベース設計（`Provider` / `Channel` / `Tool` / `Memory` など）
@@ -136,7 +136,7 @@ zeroclaw onboard --interactive
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
-# default: 127.0.0.1:3000
+# default: 127.0.0.1:42617
 zeroclaw gateway
 
 zeroclaw daemon
@@ -244,7 +244,7 @@ keyword_weight = 0.3
 
 ## セキュリティのデフォルト
 
-- Gateway の既定バインド: `127.0.0.1:3000`
+- Gateway の既定バインド: `127.0.0.1:42617`
 - 既定でペアリング必須: `require_pairing = true`
 - 既定で公開バインド禁止: `allow_public_bind = false`
 - Channel allowlist:
@@ -266,7 +266,7 @@ embedding_provider = "none"
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 require_pairing = true
 allow_public_bind = false
 ```

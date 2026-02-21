@@ -1,5 +1,6 @@
 use crate::config::schema::{
-    DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig, QQConfig, StreamMode, WhatsAppConfig,
+    default_nostr_relays, DingTalkConfig, IrcConfig, LarkReceiveMode, LinqConfig,
+    NextcloudTalkConfig, NostrConfig, QQConfig, SignalConfig, StreamMode, WhatsAppConfig,
 };
 use crate::config::{
     AutonomyConfig, BrowserConfig, ChannelsConfig, ComposioConfig, Config, DiscordConfig,
@@ -21,10 +22,10 @@ use dialoguer::{Confirm, Input, Select};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeSet;
-use std::fs;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
+use tokio::fs;
 
 // ── Project context collected during wizard ──────────────────────
 
@@ -78,6 +79,7 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         dingtalk,
         linq,
         qq,
+        nextcloud_talk,
         ..
     } = channels;
 
@@ -95,9 +97,16 @@ fn has_launchable_channels(channels: &ChannelsConfig) -> bool {
         || dingtalk.is_some()
         || linq.is_some()
         || qq.is_some()
+        || nextcloud_talk.is_some()
 }
 
 // ── Main wizard entry point ──────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveOnboardingMode {
+    FullOnboarding,
+    UpdateProviderOnly,
+}
 
 pub async fn run_wizard(force: bool) -> Result<Config> {
     println!("{}", style(BANNER).cyan().bold());
@@ -115,11 +124,16 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     println!();
 
     print_step(1, 9, "Workspace Setup");
-    let (workspace_dir, config_path) = setup_workspace()?;
-    ensure_onboard_overwrite_allowed(&config_path, force)?;
+    let (workspace_dir, config_path) = setup_workspace().await?;
+    match resolve_interactive_onboarding_mode(&config_path, force)? {
+        InteractiveOnboardingMode::FullOnboarding => {}
+        InteractiveOnboardingMode::UpdateProviderOnly => {
+            return run_provider_update_wizard(&workspace_dir, &config_path).await;
+        }
+    }
 
     print_step(2, 9, "AI Provider & API Key");
-    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir)?;
+    let (provider, api_key, model, provider_api_url) = setup_provider(&workspace_dir).await?;
 
     print_step(3, 9, "Channels (How You Talk to ZeroClaw)");
     let channels_config = setup_channels()?;
@@ -140,7 +154,7 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
     let project_ctx = setup_project_context()?;
 
     print_step(9, 9, "Workspace Files");
-    scaffold_workspace(&workspace_dir, &project_ctx)?;
+    scaffold_workspace(&workspace_dir, &project_ctx).await?;
 
     // ── Build config ──
     // Defaults: SQLite memory, supervised autonomy, workspace-scoped, native runtime
@@ -184,8 +198,10 @@ pub async fn run_wizard(force: bool) -> Result<Config> {
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        hooks: crate::config::HooksConfig::default(),
         hardware: hardware_config,
         query_classification: crate::config::QueryClassificationConfig::default(),
+        transcription: crate::config::TranscriptionConfig::default(),
     };
 
     println!(
@@ -286,6 +302,85 @@ pub async fn run_channels_repair_wizard() -> Result<Config> {
     Ok(config)
 }
 
+/// Interactive flow: update only provider/model/api key while preserving existing config.
+async fn run_provider_update_wizard(workspace_dir: &Path, config_path: &Path) -> Result<Config> {
+    println!();
+    println!(
+        "  {} Existing config detected. Running provider-only update mode (preserving channels, memory, tunnel, hooks, and other settings).",
+        style("↻").cyan().bold()
+    );
+
+    let raw = fs::read_to_string(config_path).await.with_context(|| {
+        format!(
+            "Failed to read existing config at {}",
+            config_path.display()
+        )
+    })?;
+    let mut config: Config = toml::from_str(&raw).with_context(|| {
+        format!(
+            "Failed to parse existing config at {}",
+            config_path.display()
+        )
+    })?;
+    config.workspace_dir = workspace_dir.to_path_buf();
+    config.config_path = config_path.to_path_buf();
+
+    print_step(1, 1, "AI Provider & API Key");
+    let (provider, api_key, model, provider_api_url) = setup_provider(workspace_dir).await?;
+    apply_provider_update(&mut config, provider, api_key, model, provider_api_url);
+
+    config.save().await?;
+    persist_workspace_selection(&config.config_path).await?;
+
+    println!(
+        "  {} Provider settings updated at {}",
+        style("✓").green().bold(),
+        style(config.config_path.display()).green()
+    );
+    print_summary(&config);
+
+    let has_channels = has_launchable_channels(&config.channels_config);
+    if has_channels && config.api_key.is_some() {
+        let launch: bool = Confirm::new()
+            .with_prompt(format!(
+                "  {} Launch channels now? (connected channels → AI → reply)",
+                style("🚀").cyan()
+            ))
+            .default(true)
+            .interact()?;
+
+        if launch {
+            println!();
+            println!(
+                "  {} {}",
+                style("⚡").cyan(),
+                style("Starting channel server...").white().bold()
+            );
+            println!();
+            std::env::set_var("ZEROCLAW_AUTOSTART_CHANNELS", "1");
+        }
+    }
+
+    Ok(config)
+}
+
+fn apply_provider_update(
+    config: &mut Config,
+    provider: String,
+    api_key: String,
+    model: String,
+    provider_api_url: Option<String>,
+) {
+    config.default_provider = Some(provider);
+    config.default_model = Some(model);
+    config.api_url = provider_api_url;
+    config.api_key = if api_key.trim().is_empty() {
+        None
+    } else {
+        Some(api_key)
+    };
+}
+
 // ── Quick setup (zero prompts) ───────────────────────────────────
 
 /// Non-interactive setup: generates a sensible default config instantly.
@@ -352,6 +447,28 @@ pub async fn run_quick_setup(
     .await
 }
 
+fn resolve_quick_setup_dirs_with_home(home: &Path) -> (PathBuf, PathBuf) {
+    if let Ok(custom_config_dir) = std::env::var("ZEROCLAW_CONFIG_DIR") {
+        let trimmed = custom_config_dir.trim();
+        if !trimmed.is_empty() {
+            let config_dir = PathBuf::from(trimmed);
+            return (config_dir.clone(), config_dir.join("workspace"));
+        }
+    }
+
+    if let Ok(custom_workspace) = std::env::var("ZEROCLAW_WORKSPACE") {
+        let trimmed = custom_workspace.trim();
+        if !trimmed.is_empty() {
+            return crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(
+                trimmed,
+            ));
+        }
+    }
+
+    let config_dir = home.join(".zeroclaw");
+    (config_dir.clone(), config_dir.join("workspace"))
+}
+
 #[allow(clippy::too_many_lines)]
 async fn run_quick_setup_with_home(
     credential_override: Option<&str>,
@@ -370,12 +487,13 @@ async fn run_quick_setup_with_home(
     );
     println!();
 
-    let zeroclaw_dir = home.join(".zeroclaw");
-    let workspace_dir = zeroclaw_dir.join("workspace");
+    let (zeroclaw_dir, workspace_dir) = resolve_quick_setup_dirs_with_home(home);
     let config_path = zeroclaw_dir.join("config.toml");
 
     ensure_onboard_overwrite_allowed(&config_path, force)?;
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     let provider_name = provider.unwrap_or("openrouter").to_string();
     let model = model_override
@@ -428,8 +546,10 @@ async fn run_quick_setup_with_home(
         cost: crate::config::CostConfig::default(),
         peripherals: crate::config::PeripheralsConfig::default(),
         agents: std::collections::HashMap::new(),
+        hooks: crate::config::HooksConfig::default(),
         hardware: crate::config::HardwareConfig::default(),
         query_classification: crate::config::QueryClassificationConfig::default(),
+        transcription: crate::config::TranscriptionConfig::default(),
     };
 
     config.save().await?;
@@ -444,7 +564,7 @@ async fn run_quick_setup_with_home(
             "Be warm, natural, and clear. Use occasional relevant emojis (1-2 max) and avoid robotic phrasing."
                 .into(),
     };
-    scaffold_workspace(&workspace_dir, &default_ctx)?;
+    scaffold_workspace(&workspace_dir, &default_ctx).await?;
 
     println!(
         "  {} Workspace:  {}",
@@ -552,7 +672,15 @@ fn canonical_provider_name(provider_name: &str) -> &str {
 fn allows_unauthenticated_model_fetch(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "openrouter" | "ollama" | "llamacpp" | "venice" | "astrai" | "nvidia"
+        "openrouter"
+            | "ollama"
+            | "llamacpp"
+            | "sglang"
+            | "vllm"
+            | "osaurus"
+            | "venice"
+            | "astrai"
+            | "nvidia"
     )
 }
 
@@ -568,7 +696,6 @@ const MINIMAX_ONBOARD_MODELS: [(&str, &str); 5] = [
 fn default_model_for_provider(provider: &str) -> String {
     match canonical_provider_name(provider) {
         "anthropic" => "claude-sonnet-4-5-20250929".into(),
-        "openrouter" => "anthropic/claude-sonnet-4.6".into(),
         "openai" => "gpt-5.2".into(),
         "openai-codex" => "gpt-5-codex".into(),
         "venice" => "zai-org-glm-5".into(),
@@ -587,11 +714,11 @@ fn default_model_for_provider(provider: &str) -> String {
         "qwen-code" => "qwen3-coder-plus".into(),
         "ollama" => "llama3.2".into(),
         "llamacpp" => "ggml-org/gpt-oss-20b-GGUF".into(),
+        "sglang" | "vllm" | "osaurus" => "default".into(),
         "gemini" => "gemini-2.5-pro".into(),
         "kimi-code" => "kimi-for-coding".into(),
         "bedrock" => "anthropic.claude-sonnet-4-5-20250929-v1:0".into(),
         "nvidia" => "meta/llama-3.3-70b-instruct".into(),
-        "astrai" => "anthropic/claude-sonnet-4.6".into(),
         _ => "anthropic/claude-sonnet-4.6".into(),
     }
 }
@@ -935,6 +1062,34 @@ fn curated_models_for_provider(provider_name: &str) -> Vec<(String, String)> {
                 "Qwen2.5 Coder 7B GGUF (coding-focused)".to_string(),
             ),
         ],
+        "sglang" | "vllm" => vec![
+            (
+                "meta-llama/Llama-3.1-8B-Instruct".to_string(),
+                "Llama 3.1 8B Instruct (popular, fast)".to_string(),
+            ),
+            (
+                "meta-llama/Llama-3.1-70B-Instruct".to_string(),
+                "Llama 3.1 70B Instruct (high quality)".to_string(),
+            ),
+            (
+                "Qwen/Qwen2.5-Coder-7B-Instruct".to_string(),
+                "Qwen2.5 Coder 7B Instruct (coding-focused)".to_string(),
+            ),
+        ],
+        "osaurus" => vec![
+            (
+                "qwen3-30b-a3b-8bit".to_string(),
+                "Qwen3 30B A3B (local, balanced)".to_string(),
+            ),
+            (
+                "gemma-3n-e4b-it-lm-4bit".to_string(),
+                "Gemma 3N E4B (local, efficient)".to_string(),
+            ),
+            (
+                "phi-4-mini-reasoning-mlx-4bit".to_string(),
+                "Phi-4 Mini Reasoning (local, fast reasoning)".to_string(),
+            ),
+        ],
         "bedrock" => vec![
             (
                 "anthropic.claude-sonnet-4-6".to_string(),
@@ -989,6 +1144,9 @@ fn supports_live_model_fetch(provider_name: &str) -> bool {
             | "gemini"
             | "ollama"
             | "llamacpp"
+            | "sglang"
+            | "vllm"
+            | "osaurus"
             | "astrai"
             | "venice"
             | "fireworks"
@@ -1025,6 +1183,9 @@ fn models_endpoint_for_provider(provider_name: &str) -> Option<&'static str> {
             "nvidia" => Some("https://integrate.api.nvidia.com/v1/models"),
             "astrai" => Some("https://as-trai.com/v1/models"),
             "llamacpp" => Some("http://localhost:8080/v1/models"),
+            "sglang" => Some("http://localhost:30000/v1/models"),
+            "vllm" => Some("http://localhost:8000/v1/models"),
+            "osaurus" => Some("http://localhost:1337/v1/models"),
             _ => None,
         },
     }
@@ -1255,7 +1416,10 @@ fn resolve_live_models_endpoint(
     provider_name: &str,
     provider_api_url: Option<&str>,
 ) -> Option<String> {
-    if canonical_provider_name(provider_name) == "llamacpp" {
+    if matches!(
+        canonical_provider_name(provider_name),
+        "llamacpp" | "sglang" | "vllm" | "osaurus"
+    ) {
         if let Some(url) = provider_api_url
             .map(str::trim)
             .filter(|url| !url.is_empty())
@@ -1378,13 +1542,14 @@ fn now_unix_secs() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
+async fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     let path = model_cache_path(workspace_dir);
     if !path.exists() {
         return Ok(ModelCacheState::default());
     }
 
     let raw = fs::read_to_string(&path)
+        .await
         .with_context(|| format!("failed to read model cache at {}", path.display()))?;
 
     match serde_json::from_str::<ModelCacheState>(&raw) {
@@ -1393,10 +1558,10 @@ fn load_model_cache_state(workspace_dir: &Path) -> Result<ModelCacheState> {
     }
 }
 
-fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
+async fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Result<()> {
     let path = model_cache_path(workspace_dir);
     if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| {
+        fs::create_dir_all(parent).await.with_context(|| {
             format!(
                 "failed to create model cache directory {}",
                 parent.display()
@@ -1406,12 +1571,13 @@ fn save_model_cache_state(workspace_dir: &Path, state: &ModelCacheState) -> Resu
 
     let json = serde_json::to_vec_pretty(state).context("failed to serialize model cache")?;
     fs::write(&path, json)
+        .await
         .with_context(|| format!("failed to write model cache at {}", path.display()))?;
 
     Ok(())
 }
 
-fn cache_live_models_for_provider(
+async fn cache_live_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     models: &[String],
@@ -1421,7 +1587,7 @@ fn cache_live_models_for_provider(
         return Ok(());
     }
 
-    let mut state = load_model_cache_state(workspace_dir)?;
+    let mut state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     if let Some(entry) = state
@@ -1439,15 +1605,15 @@ fn cache_live_models_for_provider(
         });
     }
 
-    save_model_cache_state(workspace_dir, &state)
+    save_model_cache_state(workspace_dir, &state).await
 }
 
-fn load_cached_models_for_provider_internal(
+async fn load_cached_models_for_provider_internal(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: Option<u64>,
 ) -> Result<Option<CachedModels>> {
-    let state = load_model_cache_state(workspace_dir)?;
+    let state = load_model_cache_state(workspace_dir).await?;
     let now = now_unix_secs();
 
     let Some(entry) = state
@@ -1473,19 +1639,19 @@ fn load_cached_models_for_provider_internal(
     }))
 }
 
-fn load_cached_models_for_provider(
+async fn load_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
     ttl_secs: u64,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs))
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, Some(ttl_secs)).await
 }
 
-fn load_any_cached_models_for_provider(
+async fn load_any_cached_models_for_provider(
     workspace_dir: &Path,
     provider_name: &str,
 ) -> Result<Option<CachedModels>> {
-    load_cached_models_for_provider_internal(workspace_dir, provider_name, None)
+    load_cached_models_for_provider_internal(workspace_dir, provider_name, None).await
 }
 
 fn humanize_age(age_secs: u64) -> String {
@@ -1522,7 +1688,7 @@ fn print_model_preview(models: &[String]) {
     }
 }
 
-pub fn run_models_refresh(
+pub async fn run_models_refresh(
     config: &Config,
     provider_override: Option<&str>,
     force: bool,
@@ -1546,7 +1712,9 @@ pub fn run_models_refresh(
             &config.workspace_dir,
             &provider_name,
             MODEL_CACHE_TTL_SECS,
-        )? {
+        )
+        .await?
+        {
             println!(
                 "Using cached model list for '{}' (updated {} ago):",
                 provider_name,
@@ -1566,7 +1734,7 @@ pub fn run_models_refresh(
 
     match fetch_live_models_for_provider(&provider_name, &api_key, config.api_url.as_deref()) {
         Ok(models) if !models.is_empty() => {
-            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models)?;
+            cache_live_models_for_provider(&config.workspace_dir, &provider_name, &models).await?;
             println!(
                 "Refreshed '{}' model cache with {} models.",
                 provider_name,
@@ -1577,7 +1745,7 @@ pub fn run_models_refresh(
         }
         Ok(_) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Provider returned no models; using stale cache (updated {} ago):",
@@ -1591,7 +1759,7 @@ pub fn run_models_refresh(
         }
         Err(error) => {
             if let Some(stale_cache) =
-                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name)?
+                load_any_cached_models_for_provider(&config.workspace_dir, &provider_name).await?
             {
                 println!(
                     "Live refresh failed ({}). Falling back to stale cache (updated {} ago):",
@@ -1622,6 +1790,52 @@ fn print_step(current: u8, total: u8, title: &str) {
 
 fn print_bullet(text: &str) {
     println!("  {} {}", style("›").cyan(), text);
+}
+
+fn resolve_interactive_onboarding_mode(
+    config_path: &Path,
+    force: bool,
+) -> Result<InteractiveOnboardingMode> {
+    if !config_path.exists() {
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if force {
+        println!(
+            "  {} Existing config detected at {}. Proceeding with full onboarding because --force was provided.",
+            style("!").yellow().bold(),
+            style(config_path.display()).yellow()
+        );
+        return Ok(InteractiveOnboardingMode::FullOnboarding);
+    }
+
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        bail!(
+            "Refusing to overwrite existing config at {} in non-interactive mode. Re-run with --force if overwrite is intentional.",
+            config_path.display()
+        );
+    }
+
+    let options = [
+        "Full onboarding (overwrite config.toml)",
+        "Update AI provider/model/API key only (preserve existing configuration)",
+        "Cancel",
+    ];
+
+    let mode = Select::new()
+        .with_prompt(format!(
+            "  Existing config found at {}. Select setup mode",
+            config_path.display()
+        ))
+        .items(&options)
+        .default(1)
+        .interact()?;
+
+    match mode {
+        0 => Ok(InteractiveOnboardingMode::FullOnboarding),
+        1 => Ok(InteractiveOnboardingMode::UpdateProviderOnly),
+        _ => bail!("Onboarding canceled: existing configuration was left unchanged."),
+    }
 }
 
 fn ensure_onboard_overwrite_allowed(config_path: &Path, force: bool) -> Result<()> {
@@ -1676,15 +1890,13 @@ async fn persist_workspace_selection(config_path: &Path) -> Result<()> {
 
 // ── Step 1: Workspace ────────────────────────────────────────────
 
-fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
-    let home = directories::UserDirs::new()
-        .map(|u| u.home_dir().to_path_buf())
-        .context("Could not find home directory")?;
-    let default_dir = home.join(".zeroclaw");
+async fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
+    let (default_config_dir, default_workspace_dir) =
+        crate::config::schema::resolve_runtime_dirs_for_onboarding().await?;
 
     print_bullet(&format!(
         "Default location: {}",
-        style(default_dir.display()).green()
+        style(default_workspace_dir.display()).green()
     ));
 
     let use_default = Confirm::new()
@@ -1692,20 +1904,21 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
         .default(true)
         .interact()?;
 
-    let zeroclaw_dir = if use_default {
-        default_dir
+    let (config_dir, workspace_dir) = if use_default {
+        (default_config_dir, default_workspace_dir)
     } else {
         let custom: String = Input::new()
             .with_prompt("  Enter workspace path")
             .interact_text()?;
         let expanded = shellexpand::tilde(&custom).to_string();
-        PathBuf::from(expanded)
+        crate::config::schema::resolve_config_dir_for_workspace(&PathBuf::from(expanded))
     };
 
-    let workspace_dir = zeroclaw_dir.join("workspace");
-    let config_path = zeroclaw_dir.join("config.toml");
+    let config_path = config_dir.join("config.toml");
 
-    fs::create_dir_all(&workspace_dir).context("Failed to create workspace directory")?;
+    fs::create_dir_all(&workspace_dir)
+        .await
+        .context("Failed to create workspace directory")?;
 
     println!(
         "  {} Workspace: {}",
@@ -1719,14 +1932,14 @@ fn setup_workspace() -> Result<(PathBuf, PathBuf)> {
 // ── Step 2: Provider & API Key ───────────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
+async fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Option<String>)> {
     // ── Tier selection ──
     let tiers = vec![
         "⭐ Recommended (OpenRouter, Venice, Anthropic, OpenAI, Gemini)",
         "⚡ Fast inference (Groq, Fireworks, Together AI, NVIDIA NIM)",
         "🌐 Gateway / proxy (Vercel AI, Cloudflare AI, Amazon Bedrock)",
         "🔬 Specialized (Moonshot/Kimi, GLM/Zhipu, MiniMax, Qwen/DashScope, Qianfan, Z.AI, Synthetic, OpenCode Zen, Cohere)",
-        "🏠 Local / private (Ollama, llama.cpp server — no API key needed)",
+        "🏠 Local / private (Ollama, llama.cpp server, vLLM — no API key needed)",
         "🔧 Custom — bring your own OpenAI-compatible API",
     ];
 
@@ -1804,13 +2017,7 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             ("opencode", "OpenCode Zen — code-focused AI"),
             ("cohere", "Cohere — Command R+ & embeddings"),
         ],
-        4 => vec![
-            ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
-            (
-                "llamacpp",
-                "llama.cpp server — local OpenAI-compatible endpoint",
-            ),
-        ],
+        4 => local_provider_choices(),
         _ => vec![], // Custom — handled below
     };
 
@@ -1949,6 +2156,99 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
             print_bullet(&format!(
                 "No API key provided. Set {} later only if your server requires authentication.",
                 style("LLAMACPP_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "sglang" {
+        let raw_url: String = Input::new()
+            .with_prompt("  SGLang server endpoint URL")
+            .default("http://localhost:30000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("SGLang endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using SGLang server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your SGLang server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for SGLang server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("SGLANG_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "vllm" {
+        let raw_url: String = Input::new()
+            .with_prompt("  vLLM server endpoint URL")
+            .default("http://localhost:8000/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("vLLM endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using vLLM server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your vLLM server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for vLLM server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("VLLM_API_KEY").yellow()
+            ));
+        }
+
+        key
+    } else if provider_name == "osaurus" {
+        let raw_url: String = Input::new()
+            .with_prompt("  Osaurus server endpoint URL")
+            .default("http://localhost:1337/v1".into())
+            .interact_text()?;
+
+        let normalized_url = raw_url.trim().trim_end_matches('/').to_string();
+        if normalized_url.is_empty() {
+            anyhow::bail!("Osaurus endpoint URL cannot be empty.");
+        }
+        provider_api_url = Some(normalized_url.clone());
+
+        print_bullet(&format!(
+            "Using Osaurus server endpoint: {}",
+            style(&normalized_url).cyan()
+        ));
+        print_bullet("No API key needed unless your Osaurus server requires authentication.");
+
+        let key: String = Input::new()
+            .with_prompt("  API key for Osaurus server (or Enter to skip)")
+            .allow_empty(true)
+            .interact_text()?;
+
+        if key.trim().is_empty() {
+            print_bullet(&format!(
+                "No API key provided. Set {} later only if your server requires authentication.",
+                style("OSAURUS_API_KEY").yellow()
             ));
         }
 
@@ -2188,7 +2488,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
         if can_fetch_without_key || has_api_key {
             if let Some(cached) =
-                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)?
+                load_cached_models_for_provider(workspace_dir, provider_name, MODEL_CACHE_TTL_SECS)
+                    .await?
             {
                 let shown_count = cached.models.len().min(LIVE_MODEL_MAX_OPTIONS);
                 print_bullet(&format!(
@@ -2226,7 +2527,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
                             workspace_dir,
                             provider_name,
                             &live_model_ids,
-                        )?;
+                        )
+                        .await?;
 
                         let fetched_count = live_model_ids.len();
                         let shown_count = fetched_count.min(LIVE_MODEL_MAX_OPTIONS);
@@ -2256,7 +2558,8 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
 
                         if live_options.is_none() {
                             if let Some(stale) =
-                                load_any_cached_models_for_provider(workspace_dir, provider_name)?
+                                load_any_cached_models_for_provider(workspace_dir, provider_name)
+                                    .await?
                             {
                                 print_bullet(&format!(
                                     "Loaded stale cache from {} ago.",
@@ -2342,6 +2645,25 @@ fn setup_provider(workspace_dir: &Path) -> Result<(String, String, String, Optio
     Ok((provider_name.to_string(), api_key, model, provider_api_url))
 }
 
+fn local_provider_choices() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("ollama", "Ollama — local models (Llama, Mistral, Phi)"),
+        (
+            "llamacpp",
+            "llama.cpp server — local OpenAI-compatible endpoint",
+        ),
+        (
+            "sglang",
+            "SGLang — high-performance local serving framework",
+        ),
+        ("vllm", "vLLM — high-performance local inference engine"),
+        (
+            "osaurus",
+            "Osaurus — unified AI edge runtime (local MLX + cloud proxy + MCP)",
+        ),
+    ]
+}
+
 /// Map provider name to its conventional env var
 fn provider_env_var(name: &str) -> &'static str {
     if canonical_provider_name(name) == "qwen-code" {
@@ -2354,6 +2676,9 @@ fn provider_env_var(name: &str) -> &'static str {
         "openai" => "OPENAI_API_KEY",
         "ollama" => "OLLAMA_API_KEY",
         "llamacpp" => "LLAMACPP_API_KEY",
+        "sglang" => "SGLANG_API_KEY",
+        "vllm" => "VLLM_API_KEY",
+        "osaurus" => "OSAURUS_API_KEY",
         "venice" => "VENICE_API_KEY",
         "groq" => "GROQ_API_KEY",
         "mistral" => "MISTRAL_API_KEY",
@@ -2385,7 +2710,7 @@ fn provider_env_var(name: &str) -> &'static str {
 fn provider_supports_keyless_local_usage(provider_name: &str) -> bool {
     matches!(
         canonical_provider_name(provider_name),
-        "ollama" | "llamacpp"
+        "ollama" | "llamacpp" | "sglang" | "vllm" | "osaurus"
     )
 }
 
@@ -2806,6 +3131,49 @@ fn setup_memory() -> Result<MemoryConfig> {
 
 // ── Step 3: Channels ────────────────────────────────────────────
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ChannelMenuChoice {
+    Telegram,
+    Discord,
+    Slack,
+    IMessage,
+    Matrix,
+    Signal,
+    WhatsApp,
+    Linq,
+    Irc,
+    Webhook,
+    NextcloudTalk,
+    DingTalk,
+    QqOfficial,
+    LarkFeishu,
+    Nostr,
+    Done,
+}
+
+const CHANNEL_MENU_CHOICES: &[ChannelMenuChoice] = &[
+    ChannelMenuChoice::Telegram,
+    ChannelMenuChoice::Discord,
+    ChannelMenuChoice::Slack,
+    ChannelMenuChoice::IMessage,
+    ChannelMenuChoice::Matrix,
+    ChannelMenuChoice::Signal,
+    ChannelMenuChoice::WhatsApp,
+    ChannelMenuChoice::Linq,
+    ChannelMenuChoice::Irc,
+    ChannelMenuChoice::Webhook,
+    ChannelMenuChoice::NextcloudTalk,
+    ChannelMenuChoice::DingTalk,
+    ChannelMenuChoice::QqOfficial,
+    ChannelMenuChoice::LarkFeishu,
+    ChannelMenuChoice::Nostr,
+    ChannelMenuChoice::Done,
+];
+
+fn channel_menu_choices() -> &'static [ChannelMenuChoice] {
+    CHANNEL_MENU_CHOICES
+}
+
 #[allow(clippy::too_many_lines)]
 fn setup_channels() -> Result<ChannelsConfig> {
     print_bullet("Channels let you talk to ZeroClaw from anywhere.");
@@ -2813,37 +3181,7 @@ fn setup_channels() -> Result<ChannelsConfig> {
     println!();
 
     let mut config = ChannelsConfig::default();
-    #[derive(Clone, Copy)]
-    enum ChannelMenuChoice {
-        Telegram,
-        Discord,
-        Slack,
-        IMessage,
-        Matrix,
-        WhatsApp,
-        Linq,
-        Irc,
-        Webhook,
-        DingTalk,
-        QqOfficial,
-        LarkFeishu,
-        Done,
-    }
-    let menu_choices = [
-        ChannelMenuChoice::Telegram,
-        ChannelMenuChoice::Discord,
-        ChannelMenuChoice::Slack,
-        ChannelMenuChoice::IMessage,
-        ChannelMenuChoice::Matrix,
-        ChannelMenuChoice::WhatsApp,
-        ChannelMenuChoice::Linq,
-        ChannelMenuChoice::Irc,
-        ChannelMenuChoice::Webhook,
-        ChannelMenuChoice::DingTalk,
-        ChannelMenuChoice::QqOfficial,
-        ChannelMenuChoice::LarkFeishu,
-        ChannelMenuChoice::Done,
-    ];
+    let menu_choices = channel_menu_choices();
 
     loop {
         let options: Vec<String> = menu_choices
@@ -2889,6 +3227,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— self-hosted chat"
                     }
                 ),
+                ChannelMenuChoice::Signal => format!(
+                    "Signal     {}",
+                    if config.signal.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— signal-cli daemon bridge"
+                    }
+                ),
                 ChannelMenuChoice::WhatsApp => format!(
                     "WhatsApp   {}",
                     if config.whatsapp.is_some() {
@@ -2921,6 +3267,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "— HTTP endpoint"
                     }
                 ),
+                ChannelMenuChoice::NextcloudTalk => format!(
+                    "Nextcloud  {}",
+                    if config.nextcloud_talk.is_some() {
+                        "✅ connected"
+                    } else {
+                        "— Talk webhook + OCS API"
+                    }
+                ),
                 ChannelMenuChoice::DingTalk => format!(
                     "DingTalk   {}",
                     if config.dingtalk.is_some() {
@@ -2943,6 +3297,14 @@ fn setup_channels() -> Result<ChannelsConfig> {
                         "✅ connected"
                     } else {
                         "— Lark/Feishu Bot"
+                    }
+                ),
+                ChannelMenuChoice::Nostr => format!(
+                    "Nostr {}",
+                    if config.nostr.is_some() {
+                        "✅ connected"
+                    } else {
+                        "     — Nostr DMs"
                     }
                 ),
                 ChannelMenuChoice::Done => "Done — finish setup".to_string(),
@@ -3234,7 +3596,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     .interact_text()?;
 
                 let channel: String = Input::new()
-                    .with_prompt("  Default channel ID (optional, Enter to skip)")
+                    .with_prompt(
+                        "  Default channel ID (optional, Enter to skip for all accessible channels; '*' also means all)",
+                    )
                     .allow_empty(true)
                     .interact_text()?;
 
@@ -3438,6 +3802,102 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     room_id,
                     allowed_users,
                 });
+            }
+            ChannelMenuChoice::Signal => {
+                // ── Signal ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Signal Setup").white().bold(),
+                    style("— signal-cli daemon bridge").dim()
+                );
+                print_bullet("1. Run signal-cli daemon with HTTP enabled (default port 8686).");
+                print_bullet("2. Ensure your Signal account is registered in signal-cli.");
+                print_bullet("3. Optionally scope to DMs only or to a specific group.");
+                println!();
+
+                let http_url: String = Input::new()
+                    .with_prompt("  signal-cli HTTP URL")
+                    .default("http://127.0.0.1:8686".into())
+                    .interact_text()?;
+
+                if http_url.trim().is_empty() {
+                    println!("  {} Skipped — HTTP URL required", style("→").dim());
+                    continue;
+                }
+
+                let account: String = Input::new()
+                    .with_prompt("  Account number (E.164, e.g. +1234567890)")
+                    .interact_text()?;
+
+                if account.trim().is_empty() {
+                    println!("  {} Skipped — account number required", style("→").dim());
+                    continue;
+                }
+
+                let scope_options = [
+                    "All messages (DMs + groups)",
+                    "DM only",
+                    "Specific group ID",
+                ];
+                let scope_choice = Select::new()
+                    .with_prompt("  Message scope")
+                    .items(scope_options)
+                    .default(0)
+                    .interact()?;
+
+                let group_id = match scope_choice {
+                    1 => Some("dm".to_string()),
+                    2 => {
+                        let group_input: String =
+                            Input::new().with_prompt("  Group ID").interact_text()?;
+                        let group_input = group_input.trim().to_string();
+                        if group_input.is_empty() {
+                            println!("  {} Skipped — group ID required", style("→").dim());
+                            continue;
+                        }
+                        Some(group_input)
+                    }
+                    _ => None,
+                };
+
+                let allowed_from_raw: String = Input::new()
+                    .with_prompt(
+                        "  Allowed sender numbers (comma-separated +1234567890, or * for all)",
+                    )
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_from = if allowed_from_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_from_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                let ignore_attachments = Confirm::new()
+                    .with_prompt("  Ignore attachment-only messages?")
+                    .default(false)
+                    .interact()?;
+
+                let ignore_stories = Confirm::new()
+                    .with_prompt("  Ignore incoming stories?")
+                    .default(true)
+                    .interact()?;
+
+                config.signal = Some(SignalConfig {
+                    http_url: http_url.trim_end_matches('/').to_string(),
+                    account: account.trim().to_string(),
+                    group_id,
+                    allowed_from,
+                    ignore_attachments,
+                    ignore_stories,
+                });
+
+                println!("  {} Signal configured", style("✅").green().bold());
             }
             ChannelMenuChoice::WhatsApp => {
                 // ── WhatsApp ──
@@ -3882,6 +4342,73 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     style(&port).cyan()
                 );
             }
+            ChannelMenuChoice::NextcloudTalk => {
+                // ── Nextcloud Talk ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nextcloud Talk Setup").white().bold(),
+                    style("— Talk webhook receive + OCS API send").dim()
+                );
+                print_bullet("1. Configure your Nextcloud Talk bot app and app token.");
+                print_bullet("2. Set webhook URL to: https://<your-public-url>/nextcloud-talk");
+                print_bullet(
+                    "3. Keep webhook_secret aligned with Nextcloud signature headers if enabled.",
+                );
+                println!();
+
+                let base_url: String = Input::new()
+                    .with_prompt("  Nextcloud base URL (e.g. https://cloud.example.com)")
+                    .interact_text()?;
+
+                let base_url = base_url.trim().trim_end_matches('/').to_string();
+                if base_url.is_empty() {
+                    println!("  {} Skipped — base URL required", style("→").dim());
+                    continue;
+                }
+
+                let app_token: String = Input::new()
+                    .with_prompt("  App token (Talk bot token)")
+                    .interact_text()?;
+
+                if app_token.trim().is_empty() {
+                    println!("  {} Skipped — app token required", style("→").dim());
+                    continue;
+                }
+
+                let webhook_secret: String = Input::new()
+                    .with_prompt("  Webhook secret (optional, Enter to skip)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_users_raw: String = Input::new()
+                    .with_prompt("  Allowed Nextcloud actor IDs (comma-separated, or * for all)")
+                    .default("*".into())
+                    .interact_text()?;
+
+                let allowed_users = if allowed_users_raw.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    allowed_users_raw
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                config.nextcloud_talk = Some(NextcloudTalkConfig {
+                    base_url,
+                    app_token: app_token.trim().to_string(),
+                    webhook_secret: if webhook_secret.trim().is_empty() {
+                        None
+                    } else {
+                        Some(webhook_secret.trim().to_string())
+                    },
+                    allowed_users,
+                });
+
+                println!("  {} Nextcloud Talk configured", style("✅").green().bold());
+            }
             ChannelMenuChoice::DingTalk => {
                 // ── DingTalk ──
                 println!();
@@ -4215,6 +4742,94 @@ fn setup_channels() -> Result<ChannelsConfig> {
                     port,
                 });
             }
+            ChannelMenuChoice::Nostr => {
+                // ── Nostr ──
+                println!();
+                println!(
+                    "  {} {}",
+                    style("Nostr Setup").white().bold(),
+                    style("— private messages via NIP-04 & NIP-17").dim()
+                );
+                print_bullet("ZeroClaw will listen for encrypted DMs on Nostr relays.");
+                print_bullet("You need a Nostr private key (hex or nsec) and at least one relay.");
+                println!();
+
+                let private_key: String = Input::new()
+                    .with_prompt("  Private key (hex or nsec1...)")
+                    .interact_text()?;
+
+                if private_key.trim().is_empty() {
+                    println!("  {} Skipped", style("→").dim());
+                    continue;
+                }
+
+                // Validate the key immediately
+                match nostr_sdk::Keys::parse(private_key.trim()) {
+                    Ok(keys) => {
+                        println!(
+                            "  {} Key valid — public key: {}",
+                            style("✅").green().bold(),
+                            style(keys.public_key().to_hex()).cyan()
+                        );
+                    }
+                    Err(_) => {
+                        println!(
+                            "  {} Invalid private key — check format and try again",
+                            style("❌").red().bold()
+                        );
+                        continue;
+                    }
+                }
+
+                let default_relays = default_nostr_relays().join(",");
+                let relays_str: String = Input::new()
+                    .with_prompt("  Relay URLs (comma-separated, Enter for defaults)")
+                    .default(default_relays)
+                    .interact_text()?;
+
+                let relays: Vec<String> = relays_str
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+
+                print_bullet("Allowlist pubkeys that can message the bot (hex or npub).");
+                print_bullet("Use '*' to allow anyone (not recommended for production).");
+
+                let pubkeys_str: String = Input::new()
+                    .with_prompt("  Allowed pubkeys (comma-separated, or * for all)")
+                    .allow_empty(true)
+                    .interact_text()?;
+
+                let allowed_pubkeys: Vec<String> = if pubkeys_str.trim() == "*" {
+                    vec!["*".into()]
+                } else {
+                    pubkeys_str
+                        .split(',')
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                };
+
+                if allowed_pubkeys.is_empty() {
+                    println!(
+                        "  {} No pubkeys allowlisted — inbound messages will be denied until you add pubkeys or '*'.",
+                        style("⚠").yellow().bold()
+                    );
+                }
+
+                config.nostr = Some(NostrConfig {
+                    private_key: private_key.trim().to_string(),
+                    relays: relays.clone(),
+                    allowed_pubkeys,
+                });
+
+                println!(
+                    "  {} Nostr configured with {} relay(s)",
+                    style("✅").green().bold(),
+                    style(relays.len()).cyan()
+                );
+            }
             ChannelMenuChoice::Done => break,
         }
         println!();
@@ -4236,6 +4851,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.matrix.is_some() {
         active.push("Matrix");
+    }
+    if config.signal.is_some() {
+        active.push("Signal");
     }
     if config.whatsapp.is_some() {
         active.push("WhatsApp");
@@ -4260,6 +4878,9 @@ fn setup_channels() -> Result<ChannelsConfig> {
     }
     if config.lark.is_some() {
         active.push("Lark");
+    }
+    if config.nostr.is_some() {
+        active.push("Nostr");
     }
 
     println!(
@@ -4429,7 +5050,7 @@ fn setup_tunnel() -> Result<crate::config::TunnelConfig> {
 // ── Step 6: Scaffold workspace files ─────────────────────────────
 
 #[allow(clippy::too_many_lines)]
-fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
+async fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> {
     let agent = if ctx.agent_name.is_empty() {
         "ZeroClaw"
     } else {
@@ -4658,7 +5279,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
     // Create subdirectories
     let subdirs = ["sessions", "memory", "state", "cron", "skills"];
     for dir in &subdirs {
-        fs::create_dir_all(workspace_dir.join(dir))?;
+        fs::create_dir_all(workspace_dir.join(dir)).await?;
     }
 
     let mut created = 0;
@@ -4669,7 +5290,7 @@ fn scaffold_workspace(workspace_dir: &Path, ctx: &ProjectContext) -> Result<()> 
         if path.exists() {
             skipped += 1;
         } else {
-            fs::write(&path, content)?;
+            fs::write(&path, content).await?;
             created += 1;
         }
     }
@@ -4764,20 +5385,47 @@ fn print_summary(config: &Config) {
     if config.channels_config.slack.is_some() {
         channels.push("Slack");
     }
+    if config.channels_config.mattermost.is_some() {
+        channels.push("Mattermost");
+    }
     if config.channels_config.imessage.is_some() {
         channels.push("iMessage");
     }
     if config.channels_config.matrix.is_some() {
         channels.push("Matrix");
     }
+    if config.channels_config.signal.is_some() {
+        channels.push("Signal");
+    }
+    if config.channels_config.whatsapp.is_some() {
+        channels.push("WhatsApp");
+    }
+    if config.channels_config.linq.is_some() {
+        channels.push("Linq");
+    }
+    if config.channels_config.nextcloud_talk.is_some() {
+        channels.push("Nextcloud Talk");
+    }
     if config.channels_config.email.is_some() {
         channels.push("Email");
+    }
+    if config.channels_config.irc.is_some() {
+        channels.push("IRC");
     }
     if config.channels_config.webhook.is_some() {
         channels.push("Webhook");
     }
     if config.channels_config.lark.is_some() {
         channels.push("Lark");
+    }
+    if config.channels_config.dingtalk.is_some() {
+        channels.push("DingTalk");
+    }
+    if config.channels_config.qq.is_some() {
+        channels.push("QQ");
+    }
+    if config.channels_config.nostr.is_some() {
+        channels.push("Nostr");
     }
     println!(
         "    {} Channels:      {}",
@@ -4965,7 +5613,42 @@ fn print_summary(config: &Config) {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::{Mutex, OnceLock};
     use tempfile::TempDir;
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, previous }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var(key).ok();
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = &self.previous {
+                std::env::set_var(self.key, previous);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     // ── ProjectContext defaults ──────────────────────────────────
 
@@ -4976,6 +5659,57 @@ mod tests {
         assert!(ctx.timezone.is_empty());
         assert!(ctx.agent_name.is_empty());
         assert!(ctx.communication_style.is_empty());
+    }
+
+    #[test]
+    fn apply_provider_update_preserves_non_provider_settings() {
+        let mut config = Config::default();
+        config.default_temperature = 1.23;
+        config.memory.backend = "markdown".to_string();
+        config.skills.open_skills_enabled = true;
+        config.channels_config.cli = false;
+
+        apply_provider_update(
+            &mut config,
+            "openrouter".to_string(),
+            "sk-updated".to_string(),
+            "openai/gpt-5.2".to_string(),
+            Some("https://openrouter.ai/api/v1".to_string()),
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("openrouter"));
+        assert_eq!(config.default_model.as_deref(), Some("openai/gpt-5.2"));
+        assert_eq!(config.api_key.as_deref(), Some("sk-updated"));
+        assert_eq!(
+            config.api_url.as_deref(),
+            Some("https://openrouter.ai/api/v1")
+        );
+        assert_eq!(config.default_temperature, 1.23);
+        assert_eq!(config.memory.backend, "markdown");
+        assert!(config.skills.open_skills_enabled);
+        assert!(!config.channels_config.cli);
+    }
+
+    #[test]
+    fn apply_provider_update_clears_api_key_when_empty() {
+        let mut config = Config::default();
+        config.api_key = Some("sk-old".to_string());
+
+        apply_provider_update(
+            &mut config,
+            "anthropic".to_string(),
+            "".to_string(),
+            "claude-sonnet-4-5-20250929".to_string(),
+            None,
+        );
+
+        assert_eq!(config.default_provider.as_deref(), Some("anthropic"));
+        assert_eq!(
+            config.default_model.as_deref(),
+            Some("claude-sonnet-4-5-20250929")
+        );
+        assert!(config.api_key.is_none());
+        assert!(config.api_url.is_none());
     }
 
     #[tokio::test]
@@ -5083,13 +5817,42 @@ mod tests {
         assert!(config_raw.contains("default_model = \"custom-model-fresh\""));
     }
 
+    #[tokio::test]
+    async fn quick_setup_respects_zero_claw_workspace_env_layout() {
+        let _env_guard = env_lock().lock().unwrap();
+        let tmp = TempDir::new().unwrap();
+        let workspace_root = tmp.path().join("zeroclaw-data");
+        let workspace_dir = workspace_root.join("workspace");
+        let expected_config_path = workspace_root.join(".zeroclaw").join("config.toml");
+
+        let _workspace_env = EnvVarGuard::set(
+            "ZEROCLAW_WORKSPACE",
+            workspace_dir.to_string_lossy().as_ref(),
+        );
+        let _config_env = EnvVarGuard::unset("ZEROCLAW_CONFIG_DIR");
+
+        let config = run_quick_setup_with_home(
+            Some("sk-env"),
+            Some("openrouter"),
+            Some("model-env"),
+            Some("sqlite"),
+            false,
+            tmp.path(),
+        )
+        .await
+        .expect("quick setup should honor ZEROCLAW_WORKSPACE");
+
+        assert_eq!(config.workspace_dir, workspace_dir);
+        assert_eq!(config.config_path, expected_config_path);
+    }
+
     // ── scaffold_workspace: basic file creation ─────────────────
 
-    #[test]
-    fn scaffold_creates_all_md_files() {
+    #[tokio::test]
+    async fn scaffold_creates_all_md_files() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let expected = [
             "IDENTITY.md",
@@ -5106,11 +5869,11 @@ mod tests {
         }
     }
 
-    #[test]
-    fn scaffold_creates_all_subdirectories() {
+    #[tokio::test]
+    async fn scaffold_creates_all_subdirectories() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for dir in &["sessions", "memory", "state", "cron", "skills"] {
             assert!(tmp.path().join(dir).is_dir(), "missing subdirectory: {dir}");
@@ -5126,7 +5889,7 @@ mod tests {
             user_name: "Alice".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5152,7 +5915,7 @@ mod tests {
             timezone: "US/Pacific".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5178,7 +5941,7 @@ mod tests {
             agent_name: "Crabby".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5228,7 +5991,7 @@ mod tests {
             communication_style: "Be technical and detailed.".into(),
             ..Default::default()
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5261,7 +6024,7 @@ mod tests {
     async fn scaffold_uses_defaults_for_empty_context() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default(); // all empty
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
             .await
@@ -5304,9 +6067,11 @@ mod tests {
 
         // Pre-create SOUL.md with custom content
         let soul_path = tmp.path().join("SOUL.md");
-        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.").unwrap();
+        fs::write(&soul_path, "# My Custom Soul\nDo not overwrite me.")
+            .await
+            .unwrap();
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // SOUL.md should be untouched
         let soul = tokio::fs::read_to_string(&soul_path).await.unwrap();
@@ -5337,13 +6102,13 @@ mod tests {
             ..Default::default()
         };
 
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v1 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
 
         // Run again — should not change anything
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
         let soul_v2 = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
             .unwrap();
@@ -5357,7 +6122,7 @@ mod tests {
     async fn scaffold_files_are_non_empty() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         for f in &[
             "IDENTITY.md",
@@ -5380,7 +6145,7 @@ mod tests {
     async fn agents_md_references_on_demand_memory() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let agents = tokio::fs::read_to_string(tmp.path().join("AGENTS.md"))
             .await
@@ -5401,7 +6166,7 @@ mod tests {
     async fn memory_md_warns_about_token_cost() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let memory = tokio::fs::read_to_string(tmp.path().join("MEMORY.md"))
             .await
@@ -5422,7 +6187,7 @@ mod tests {
     async fn tools_md_lists_all_builtin_tools() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let tools = tokio::fs::read_to_string(tmp.path().join("TOOLS.md"))
             .await
@@ -5454,7 +6219,7 @@ mod tests {
     async fn soul_md_includes_emoji_awareness_guidance() {
         let tmp = TempDir::new().unwrap();
         let ctx = ProjectContext::default();
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let soul = tokio::fs::read_to_string(tmp.path().join("SOUL.md"))
             .await
@@ -5480,7 +6245,7 @@ mod tests {
             timezone: "Europe/Madrid".into(),
             communication_style: "Be direct.".into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         let user_md = tokio::fs::read_to_string(tmp.path().join("USER.md"))
             .await
@@ -5506,7 +6271,7 @@ mod tests {
                 "Be friendly, human, and conversational. Show warmth and empathy while staying efficient. Use natural contractions."
                     .into(),
         };
-        scaffold_workspace(tmp.path(), &ctx).unwrap();
+        scaffold_workspace(tmp.path(), &ctx).await.unwrap();
 
         // Verify every file got personalized
         let identity = tokio::fs::read_to_string(tmp.path().join("IDENTITY.md"))
@@ -5590,6 +6355,8 @@ mod tests {
             default_model_for_provider("llamacpp"),
             "ggml-org/gpt-oss-20b-GGUF"
         );
+        assert_eq!(default_model_for_provider("sglang"), "default");
+        assert_eq!(default_model_for_provider("vllm"), "default");
         assert_eq!(
             default_model_for_provider("astrai"),
             "anthropic/claude-sonnet-4.6"
@@ -5700,6 +6467,8 @@ mod tests {
         assert!(allows_unauthenticated_model_fetch("ollama"));
         assert!(allows_unauthenticated_model_fetch("llamacpp"));
         assert!(allows_unauthenticated_model_fetch("llama.cpp"));
+        assert!(allows_unauthenticated_model_fetch("sglang"));
+        assert!(allows_unauthenticated_model_fetch("vllm"));
         assert!(!allows_unauthenticated_model_fetch("openai"));
         assert!(!allows_unauthenticated_model_fetch("deepseek"));
     }
@@ -5741,6 +6510,8 @@ mod tests {
         assert!(supports_live_model_fetch("ollama"));
         assert!(supports_live_model_fetch("llamacpp"));
         assert!(supports_live_model_fetch("llama.cpp"));
+        assert!(supports_live_model_fetch("sglang"));
+        assert!(supports_live_model_fetch("vllm"));
         assert!(supports_live_model_fetch("astrai"));
         assert!(supports_live_model_fetch("venice"));
         assert!(supports_live_model_fetch("glm-cn"));
@@ -5851,6 +6622,14 @@ mod tests {
             models_endpoint_for_provider("llama.cpp"),
             Some("http://localhost:8080/v1/models")
         );
+        assert_eq!(
+            models_endpoint_for_provider("sglang"),
+            Some("http://localhost:30000/v1/models")
+        );
+        assert_eq!(
+            models_endpoint_for_provider("vllm"),
+            Some("http://localhost:8000/v1/models")
+        );
         assert_eq!(models_endpoint_for_provider("perplexity"), None);
         assert_eq!(models_endpoint_for_provider("unknown-provider"), None);
     }
@@ -5876,6 +6655,14 @@ mod tests {
         assert_eq!(
             resolve_live_models_endpoint("llamacpp", None),
             Some("http://localhost:8080/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("sglang", None),
+            Some("http://localhost:30000/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", None),
+            Some("http://localhost:8000/v1/models".to_string())
         );
         assert_eq!(
             resolve_live_models_endpoint("venice", Some("http://localhost:9999/v1")),
@@ -5906,6 +6693,18 @@ mod tests {
         )));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com")));
         assert!(ollama_uses_remote_endpoint(Some("https://ollama.com/api")));
+    }
+
+    #[test]
+    fn resolve_live_models_endpoint_prefers_vllm_custom_url() {
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
+        assert_eq!(
+            resolve_live_models_endpoint("vllm", Some("http://127.0.0.1:9000/v1/models")),
+            Some("http://127.0.0.1:9000/v1/models".to_string())
+        );
     }
 
     #[test]
@@ -5978,15 +6777,18 @@ mod tests {
         );
     }
 
-    #[test]
-    fn model_cache_round_trip_returns_fresh_entry() {
+    #[tokio::test]
+    async fn model_cache_round_trip_returns_fresh_entry() {
         let tmp = TempDir::new().unwrap();
         let models = vec!["gpt-5.1".to_string(), "gpt-5-mini".to_string()];
 
-        cache_live_models_for_provider(tmp.path(), "openai", &models).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &models)
+            .await
+            .unwrap();
 
-        let cached =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let cached = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         let cached = cached.expect("expected fresh cached models");
 
         assert_eq!(cached.models.len(), 2);
@@ -5994,8 +6796,8 @@ mod tests {
         assert!(cached.models.contains(&"gpt-5-mini".to_string()));
     }
 
-    #[test]
-    fn model_cache_ttl_filters_stale_entries() {
+    #[tokio::test]
+    async fn model_cache_ttl_filters_stale_entries() {
         let tmp = TempDir::new().unwrap();
         let stale = ModelCacheState {
             entries: vec![ModelCacheEntry {
@@ -6005,21 +6807,26 @@ mod tests {
             }],
         };
 
-        save_model_cache_state(tmp.path(), &stale).unwrap();
+        save_model_cache_state(tmp.path(), &stale).await.unwrap();
 
-        let fresh =
-            load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS).unwrap();
+        let fresh = load_cached_models_for_provider(tmp.path(), "openai", MODEL_CACHE_TTL_SECS)
+            .await
+            .unwrap();
         assert!(fresh.is_none());
 
-        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai").unwrap();
+        let stale_any = load_any_cached_models_for_provider(tmp.path(), "openai")
+            .await
+            .unwrap();
         assert!(stale_any.is_some());
     }
 
-    #[test]
-    fn run_models_refresh_uses_fresh_cache_without_network() {
+    #[tokio::test]
+    async fn run_models_refresh_uses_fresh_cache_without_network() {
         let tmp = TempDir::new().unwrap();
 
-        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()]).unwrap();
+        cache_live_models_for_provider(tmp.path(), "openai", &["gpt-5.1".to_string()])
+            .await
+            .unwrap();
 
         let config = Config {
             workspace_dir: tmp.path().to_path_buf(),
@@ -6027,11 +6834,11 @@ mod tests {
             ..Config::default()
         };
 
-        run_models_refresh(&config, None, false).unwrap();
+        run_models_refresh(&config, None, false).await.unwrap();
     }
 
-    #[test]
-    fn run_models_refresh_rejects_unsupported_provider() {
+    #[tokio::test]
+    async fn run_models_refresh_rejects_unsupported_provider() {
         let tmp = TempDir::new().unwrap();
 
         let config = Config {
@@ -6041,7 +6848,7 @@ mod tests {
             ..Config::default()
         };
 
-        let err = run_models_refresh(&config, None, true).unwrap_err();
+        let err = run_models_refresh(&config, None, true).await.unwrap_err();
         assert!(err
             .to_string()
             .contains("does not support live model discovery"));
@@ -6057,6 +6864,8 @@ mod tests {
         assert_eq!(provider_env_var("ollama"), "OLLAMA_API_KEY");
         assert_eq!(provider_env_var("llamacpp"), "LLAMACPP_API_KEY");
         assert_eq!(provider_env_var("llama.cpp"), "LLAMACPP_API_KEY");
+        assert_eq!(provider_env_var("sglang"), "SGLANG_API_KEY");
+        assert_eq!(provider_env_var("vllm"), "VLLM_API_KEY");
         assert_eq!(provider_env_var("xai"), "XAI_API_KEY");
         assert_eq!(provider_env_var("grok"), "XAI_API_KEY"); // alias
         assert_eq!(provider_env_var("together"), "TOGETHER_API_KEY"); // alias
@@ -6089,7 +6898,15 @@ mod tests {
         assert!(provider_supports_keyless_local_usage("ollama"));
         assert!(provider_supports_keyless_local_usage("llamacpp"));
         assert!(provider_supports_keyless_local_usage("llama.cpp"));
+        assert!(provider_supports_keyless_local_usage("sglang"));
+        assert!(provider_supports_keyless_local_usage("vllm"));
         assert!(!provider_supports_keyless_local_usage("openai"));
+    }
+
+    #[test]
+    fn local_provider_choices_include_sglang() {
+        let choices = local_provider_choices();
+        assert!(choices.iter().any(|(provider, _)| *provider == "sglang"));
     }
 
     #[test]
@@ -6150,10 +6967,27 @@ mod tests {
     }
 
     #[test]
-    fn launchable_channels_include_mattermost_and_qq() {
+    fn channel_menu_choices_include_signal_and_nextcloud_talk() {
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::Signal));
+        assert!(channel_menu_choices().contains(&ChannelMenuChoice::NextcloudTalk));
+    }
+
+    #[test]
+    fn launchable_channels_include_signal_mattermost_qq_and_nextcloud_talk() {
         let mut channels = ChannelsConfig::default();
         assert!(!has_launchable_channels(&channels));
 
+        channels.signal = Some(crate::config::schema::SignalConfig {
+            http_url: "http://127.0.0.1:8686".into(),
+            account: "+1234567890".into(),
+            group_id: None,
+            allowed_from: vec!["*".into()],
+            ignore_attachments: false,
+            ignore_stories: true,
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.signal = None;
         channels.mattermost = Some(crate::config::schema::MattermostConfig {
             url: "https://mattermost.example.com".into(),
             bot_token: "token".into(),
@@ -6168,6 +7002,15 @@ mod tests {
         channels.qq = Some(crate::config::schema::QQConfig {
             app_id: "app-id".into(),
             app_secret: "app-secret".into(),
+            allowed_users: vec!["*".into()],
+        });
+        assert!(has_launchable_channels(&channels));
+
+        channels.qq = None;
+        channels.nextcloud_talk = Some(crate::config::schema::NextcloudTalkConfig {
+            base_url: "https://cloud.example.com".into(),
+            app_token: "token".into(),
+            webhook_secret: Some("secret".into()),
             allowed_users: vec!["*".into()],
         });
         assert!(has_launchable_channels(&channels));

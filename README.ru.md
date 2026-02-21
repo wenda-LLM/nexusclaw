@@ -50,13 +50,13 @@
 
 | Дата (UTC) | Уровень | Объявление | Действие |
 |---|---|---|---|
-| 2026-02-19 | _Срочно_ | Мы **не аффилированы** с `openagen/zeroclaw` и `zeroclaw.org`. Домен `zeroclaw.org` сейчас указывает на fork `openagen/zeroclaw`, и этот домен/репозиторий выдают себя за наш официальный сайт и проект. | Не доверяйте информации, бинарникам, сборам средств и «официальным» объявлениям из этих источников. Используйте только этот репозиторий и наши верифицированные соцсети. |
-| 2026-02-19 | _Важно_ | Официальный сайт пока **не запущен**, и мы уже видим попытки выдавать себя за ZeroClaw. Пожалуйста, не участвуйте в инвестициях, сборах средств или похожих активностях от имени ZeroClaw. | Ориентируйтесь только на этот репозиторий; также следите за [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru) и [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) для официальных обновлений. |
+| 2026-02-19 | _Срочно_ | Мы **не аффилированы** с `openagen/zeroclaw` и `zeroclaw.org`. Домен `zeroclaw.org` сейчас указывает на fork `openagen/zeroclaw`, и этот домен/репозиторий выдают себя за наш официальный сайт и проект. | Не доверяйте информации, бинарникам, сборам средств и «официальным» объявлениям из этих источников. Используйте только [этот репозиторий](https://github.com/zeroclaw-labs/zeroclaw) и наши верифицированные соцсети. |
+| 2026-02-21 | _Важно_ | Наш официальный сайт уже запущен: [zeroclawlabs.ai](https://zeroclawlabs.ai). Спасибо, что дождались запуска. При этом попытки выдавать себя за ZeroClaw продолжаются, поэтому не участвуйте в инвестициях, сборах средств и похожих активностях, если они не подтверждены через наши официальные каналы. | Ориентируйтесь только на [этот репозиторий](https://github.com/zeroclaw-labs/zeroclaw); также следите за [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru) и [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) для официальных обновлений. |
 | 2026-02-19 | _Важно_ | Anthropic обновил раздел Authentication and Credential Use 2026-02-19. В нем указано, что OAuth authentication (Free/Pro/Max) предназначена только для Claude Code и Claude.ai; использование OAuth-токенов, полученных через Claude Free/Pro/Max, в любых других продуктах, инструментах или сервисах (включая Agent SDK), не допускается и может считаться нарушением Consumer Terms of Service. | Чтобы избежать потерь, временно не используйте Claude Code OAuth-интеграции. Оригинал: [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use). |
 
 ## О проекте
 
-ZeroClaw — это производительная и расширяемая инфраструктура автономного AI-агента:
+ZeroClaw — это производительная и расширяемая инфраструктура автономного AI-агента. ZeroClaw — это **операционная система времени выполнения** для агентных рабочих процессов — инфраструктура, абстрагирующая модели, инструменты, память и выполнение, позволяя создавать агентов один раз и запускать где угодно.
 
 - Нативно на Rust, единый бинарник, переносимость между ARM / x86 / RISC-V
 - Архитектура на Trait (`Provider`, `Channel`, `Tool`, `Memory` и др.)
@@ -136,7 +136,7 @@ zeroclaw onboard --interactive
 
 zeroclaw agent -m "Hello, ZeroClaw!"
 
-# default: 127.0.0.1:3000
+# default: 127.0.0.1:42617
 zeroclaw gateway
 
 zeroclaw daemon
@@ -244,7 +244,7 @@ keyword_weight = 0.3
 
 ## Важные security-дефолты
 
-- Gateway по умолчанию: `127.0.0.1:3000`
+- Gateway по умолчанию: `127.0.0.1:42617`
 - Pairing обязателен по умолчанию: `require_pairing = true`
 - Публичный bind запрещён по умолчанию: `allow_public_bind = false`
 - Семантика allowlist каналов:
@@ -266,7 +266,7 @@ embedding_provider = "none"
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 require_pairing = true
 allow_public_bind = false
 ```

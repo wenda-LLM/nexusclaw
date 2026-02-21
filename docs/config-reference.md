@@ -33,11 +33,19 @@ Schema export command:
 | `backend` | `none` | Observability backend: `none`, `noop`, `log`, `prometheus`, `otel`, `opentelemetry`, or `otlp` |
 | `otel_endpoint` | `http://localhost:4318` | OTLP HTTP endpoint used when backend is `otel` |
 | `otel_service_name` | `zeroclaw` | Service name emitted to OTLP collector |
+| `runtime_trace_mode` | `none` | Runtime trace storage mode: `none`, `rolling`, or `full` |
+| `runtime_trace_path` | `state/runtime-trace.jsonl` | Runtime trace JSONL path (relative to workspace unless absolute) |
+| `runtime_trace_max_entries` | `200` | Maximum retained events when `runtime_trace_mode = "rolling"` |
 
 Notes:
 
 - `backend = "otel"` uses OTLP HTTP export with a blocking exporter client so spans and metrics can be emitted safely from non-Tokio contexts.
 - Alias values `opentelemetry` and `otlp` map to the same OTel backend.
+- Runtime traces are intended for debugging tool-call failures and malformed model tool payloads. They can contain model output text, so keep this disabled by default on shared hosts.
+- Query runtime traces with:
+  - `zeroclaw doctor traces --limit 20`
+  - `zeroclaw doctor traces --event tool_call_result --contains \"error\"`
+  - `zeroclaw doctor traces --id <trace-id>`
 
 Example:
 
@@ -46,6 +54,9 @@ Example:
 backend = "otel"
 otel_endpoint = "http://localhost:4318"
 otel_service_name = "zeroclaw"
+runtime_trace_mode = "rolling"
+runtime_trace_path = "state/runtime-trace.jsonl"
+runtime_trace_max_entries = 200
 ```
 
 ## Environment Provider Overrides
@@ -214,7 +225,7 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `browser_open` tool (opens URLs without scraping) |
-| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for `browser_open` (exact/subdomain match, or `"*"` for all public domains) |
 | `session_name` | unset | Browser session name (for agent-browser automation) |
 | `backend` | `agent_browser` | Browser automation backend: `"agent_browser"`, `"rust_native"`, `"computer_use"`, or `"auto"` |
 | `native_headless` | `true` | Headless mode for rust-native backend |
@@ -244,21 +255,22 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `enabled` | `false` | Enable `http_request` tool for API interactions |
-| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact or subdomain match) |
+| `allowed_domains` | `[]` | Allowed domains for HTTP requests (exact/subdomain match, or `"*"` for all public domains) |
 | `max_response_size` | `1000000` | Maximum response size in bytes (default: 1 MB) |
 | `timeout_secs` | `30` | Request timeout in seconds |
 
 Notes:
 
 - Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`).
+- Use exact domain or subdomain matching (e.g. `"api.example.com"`, `"example.com"`), or `"*"` to allow any public domain.
+- Local/private targets are still blocked even when `"*"` is configured.
 
 ## `[gateway]`
 
 | Key | Default | Purpose |
 |---|---|---|
 | `host` | `127.0.0.1` | bind address |
-| `port` | `3000` | gateway listen port |
+| `port` | `42617` | gateway listen port |
 | `require_pairing` | `true` | require pairing before bearer auth |
 | `allow_public_bind` | `false` | block accidental public exposure |
 
@@ -267,11 +279,12 @@ Notes:
 | Key | Default | Purpose |
 |---|---|---|
 | `level` | `supervised` | `read_only`, `supervised`, or `full` |
-| `workspace_only` | `true` | restrict writes/command paths to workspace scope |
+| `workspace_only` | `true` | reject absolute path inputs unless explicitly disabled |
 | `allowed_commands` | _required for shell execution_ | allowlist of executable names |
-| `forbidden_paths` | `[]` | explicit path denylist |
-| `max_actions_per_hour` | `100` | per-policy action budget |
-| `max_cost_per_day_cents` | `1000` | per-policy spend guardrail |
+| `forbidden_paths` | built-in protected list | explicit path denylist (system paths + sensitive dotdirs by default) |
+| `allowed_roots` | `[]` | additional roots allowed outside workspace after canonicalization |
+| `max_actions_per_hour` | `20` | per-policy action budget |
+| `max_cost_per_day_cents` | `500` | per-policy spend guardrail |
 | `require_approval_for_medium_risk` | `true` | approval gate for medium-risk commands |
 | `block_high_risk_commands` | `true` | hard block for high-risk commands |
 | `auto_approve` | `[]` | tool operations always auto-approved |
@@ -280,8 +293,17 @@ Notes:
 Notes:
 
 - `level = "full"` skips medium-risk approval gating for shell execution, while still enforcing configured guardrails.
+- Access outside the workspace requires `allowed_roots`, even when `workspace_only = false`.
+- `allowed_roots` supports absolute paths, `~/...`, and workspace-relative paths.
 - Shell separator/operator parsing is quote-aware. Characters like `;` inside quoted arguments are treated as literals, not command separators.
 - Unquoted shell chaining/operators are still enforced by policy checks (`;`, `|`, `&&`, `||`, background chaining, and redirects).
+
+```toml
+[autonomy]
+workspace_only = false
+forbidden_paths = ["/etc", "/root", "/proc", "/sys", "~/.ssh", "~/.gnupg", "~/.aws"]
+allowed_roots = ["~/Desktop/projects", "/opt/shared-repo"]
+```
 
 ## `[memory]`
 
@@ -397,6 +419,7 @@ Examples:
 - `[channels_config.linq]`
 - `[channels_config.nextcloud_talk]`
 - `[channels_config.email]`
+- `[channels_config.nostr]`
 
 Notes:
 
@@ -409,6 +432,19 @@ Notes:
 - Telegram-only interruption behavior is controlled with `channels_config.telegram.interrupt_on_new_message` (default `false`).
   When enabled, a newer message from the same sender in the same chat cancels the in-flight request and preserves interrupted user context.
 - While `zeroclaw channel start` is running, updates to `default_provider`, `default_model`, `default_temperature`, `api_key`, `api_url`, and `reliability.*` are hot-applied from `config.toml` on the next inbound message.
+
+### `[channels_config.nostr]`
+
+| Key | Default | Purpose |
+|---|---|---|
+| `private_key` | _required_ | Nostr private key (hex or `nsec1…` bech32); encrypted at rest when `secrets.encrypt = true` |
+| `relays` | see note | List of relay WebSocket URLs; defaults to `relay.damus.io`, `nos.lol`, `relay.primal.net`, `relay.snort.social` |
+| `allowed_pubkeys` | `[]` (deny all) | Sender allowlist (hex or `npub1…`); use `"*"` to allow all senders |
+
+Notes:
+
+- Supports both NIP-04 (legacy encrypted DMs) and NIP-17 (gift-wrapped private messages). Replies mirror the sender's protocol automatically.
+- The `private_key` is a high-value secret; keep `secrets.encrypt = true` (the default) in production.
 
 See detailed channel matrix and allowlist behavior in [channels-reference.md](channels-reference.md).
 

@@ -14,6 +14,7 @@
 //! To add a new channel, implement [`Channel`] in a new submodule and wire it into
 //! [`start_channels`]. See `AGENTS.md` §7.2 for the full change playbook.
 
+pub mod clawdtalk;
 pub mod cli;
 pub mod dingtalk;
 pub mod discord;
@@ -27,17 +28,20 @@ pub mod linq;
 pub mod matrix;
 pub mod mattermost;
 pub mod nextcloud_talk;
+pub mod nostr;
 pub mod qq;
 pub mod signal;
 pub mod slack;
 pub mod telegram;
 pub mod traits;
+pub mod transcription;
 pub mod whatsapp;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_storage;
 #[cfg(feature = "whatsapp-web")]
 pub mod whatsapp_web;
 
+pub use clawdtalk::{ClawdTalkChannel, ClawdTalkConfig};
 pub use cli::CliChannel;
 pub use dingtalk::DingTalkChannel;
 pub use discord::DiscordChannel;
@@ -51,6 +55,7 @@ pub use linq::LinqChannel;
 pub use matrix::MatrixChannel;
 pub use mattermost::MattermostChannel;
 pub use nextcloud_talk::NextcloudTalkChannel;
+pub use nostr::NostrChannel;
 pub use qq::QQChannel;
 pub use signal::SignalChannel;
 pub use slack::SlackChannel;
@@ -60,11 +65,11 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
-use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop};
+use crate::agent::loop_::{build_tool_instructions, run_tool_call_loop, scrub_credentials};
 use crate::config::Config;
 use crate::identity;
 use crate::memory::{self, Memory};
-use crate::observability::{self, Observer};
+use crate::observability::{self, runtime_trace, Observer};
 use crate::providers::{self, ChatMessage, Provider};
 use crate::runtime;
 use crate::security::SecurityPolicy;
@@ -113,6 +118,8 @@ const MEMORY_CONTEXT_ENTRY_MAX_CHARS: usize = 800;
 const MEMORY_CONTEXT_MAX_CHARS: usize = 4_000;
 const CHANNEL_HISTORY_COMPACT_KEEP_MESSAGES: usize = 12;
 const CHANNEL_HISTORY_COMPACT_CONTENT_CHARS: usize = 600;
+/// Guardrail for hook-modified outbound channel content.
+const CHANNEL_HOOK_MAX_OUTBOUND_CHARS: usize = 20_000;
 
 type ProviderCacheMap = Arc<Mutex<HashMap<String, Arc<dyn Provider>>>>;
 type RouteSelectionMap = Arc<Mutex<HashMap<String, ChannelRouteSelection>>>;
@@ -212,6 +219,8 @@ struct ChannelRuntimeContext {
     message_timeout_secs: u64,
     interrupt_on_new_message: bool,
     multimodal: crate::config::MultimodalConfig,
+    hooks: Option<Arc<crate::hooks::HookRunner>>,
+    non_cli_excluded_tools: Arc<Vec<String>>,
 }
 
 #[derive(Clone)]
@@ -259,10 +268,137 @@ fn interruption_scope_key(msg: &traits::ChannelMessage) -> String {
     format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender)
 }
 
+/// Strip tool-call XML tags from outgoing messages.
+///
+/// LLM responses may contain `<function_calls>`, `<function_call>`,
+/// `<tool_call>`, `<toolcall>`, `<tool-call>`, `<tool>`, or `<invoke>`
+/// blocks that are internal protocol and must not be forwarded to end
+/// users on any channel.
+fn strip_tool_call_tags(message: &str) -> String {
+    const TOOL_CALL_OPEN_TAGS: [&str; 7] = [
+        "<function_calls>",
+        "<function_call>",
+        "<tool_call>",
+        "<toolcall>",
+        "<tool-call>",
+        "<tool>",
+        "<invoke>",
+    ];
+
+    fn find_first_tag<'a>(haystack: &str, tags: &'a [&'a str]) -> Option<(usize, &'a str)> {
+        tags.iter()
+            .filter_map(|tag| haystack.find(tag).map(|idx| (idx, *tag)))
+            .min_by_key(|(idx, _)| *idx)
+    }
+
+    fn matching_close_tag(open_tag: &str) -> Option<&'static str> {
+        match open_tag {
+            "<function_calls>" => Some("</function_calls>"),
+            "<function_call>" => Some("</function_call>"),
+            "<tool_call>" => Some("</tool_call>"),
+            "<toolcall>" => Some("</toolcall>"),
+            "<tool-call>" => Some("</tool-call>"),
+            "<tool>" => Some("</tool>"),
+            "<invoke>" => Some("</invoke>"),
+            _ => None,
+        }
+    }
+
+    fn extract_first_json_end(input: &str) -> Option<usize> {
+        let trimmed = input.trim_start();
+        let trim_offset = input.len().saturating_sub(trimmed.len());
+
+        for (byte_idx, ch) in trimmed.char_indices() {
+            if ch != '{' && ch != '[' {
+                continue;
+            }
+
+            let slice = &trimmed[byte_idx..];
+            let mut stream =
+                serde_json::Deserializer::from_str(slice).into_iter::<serde_json::Value>();
+            if let Some(Ok(_value)) = stream.next() {
+                let consumed = stream.byte_offset();
+                if consumed > 0 {
+                    return Some(trim_offset + byte_idx + consumed);
+                }
+            }
+        }
+
+        None
+    }
+
+    fn strip_leading_close_tags(mut input: &str) -> &str {
+        loop {
+            let trimmed = input.trim_start();
+            if !trimmed.starts_with("</") {
+                return trimmed;
+            }
+
+            let Some(close_end) = trimmed.find('>') else {
+                return "";
+            };
+            input = &trimmed[close_end + 1..];
+        }
+    }
+
+    let mut kept_segments = Vec::new();
+    let mut remaining = message;
+
+    while let Some((start, open_tag)) = find_first_tag(remaining, &TOOL_CALL_OPEN_TAGS) {
+        let before = &remaining[..start];
+        if !before.is_empty() {
+            kept_segments.push(before.to_string());
+        }
+
+        let Some(close_tag) = matching_close_tag(open_tag) else {
+            break;
+        };
+        let after_open = &remaining[start + open_tag.len()..];
+
+        if let Some(close_idx) = after_open.find(close_tag) {
+            remaining = &after_open[close_idx + close_tag.len()..];
+            continue;
+        }
+
+        if let Some(consumed_end) = extract_first_json_end(after_open) {
+            remaining = strip_leading_close_tags(&after_open[consumed_end..]);
+            continue;
+        }
+
+        kept_segments.push(remaining[start..].to_string());
+        remaining = "";
+        break;
+    }
+
+    if !remaining.is_empty() {
+        kept_segments.push(remaining.to_string());
+    }
+
+    let mut result = kept_segments.concat();
+
+    // Clean up any resulting blank lines (but preserve paragraphs)
+    while result.contains("\n\n\n") {
+        result = result.replace("\n\n\n", "\n\n");
+    }
+
+    result.trim().to_string()
+}
+
 fn channel_delivery_instructions(channel_name: &str) -> Option<&'static str> {
     match channel_name {
         "telegram" => Some(
-            "When responding on Telegram, include media markers for files or URLs that should be sent as attachments. Use one marker per attachment with this exact syntax: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]. Keep normal user-facing text outside markers and never wrap markers in code fences.",
+            "When responding on Telegram:\n\
+             - Include media markers for files or URLs that should be sent as attachments\n\
+             - Use **bold** for key terms, section titles, and important info (renders as <b>)\n\
+             - Use *italic* for emphasis (renders as <i>)\n\
+             - Use `backticks` for inline code, commands, or technical terms\n\
+             - Use triple backticks for code blocks\n\
+             - Use emoji naturally to add personality — but don't overdo it\n\
+             - Be concise and direct. Skip filler phrases like 'Great question!' or 'Certainly!'\n\
+             - Structure longer answers with bold headers, not raw markdown ## headers\n\
+             - For media attachments use markers: [IMAGE:<path-or-url>], [DOCUMENT:<path-or-url>], [VIDEO:<path-or-url>], [AUDIO:<path-or-url>], or [VOICE:<path-or-url>]\n\
+             - Keep normal text outside markers and never wrap markers in code fences.\n\
+             - Use tool results silently: answer the latest user message directly, and do not narrate delayed/internal tool execution bookkeeping.",
         ),
         _ => None,
     }
@@ -625,6 +761,33 @@ fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatM
     while turns.len() > MAX_CHANNEL_HISTORY {
         turns.remove(0);
     }
+}
+
+fn rollback_orphan_user_turn(
+    ctx: &ChannelRuntimeContext,
+    sender_key: &str,
+    expected_content: &str,
+) -> bool {
+    let mut histories = ctx
+        .conversation_histories
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let Some(turns) = histories.get_mut(sender_key) else {
+        return false;
+    };
+
+    let should_pop = turns
+        .last()
+        .is_some_and(|turn| turn.role == "user" && turn.content == expected_content);
+    if !should_pop {
+        return false;
+    }
+
+    turns.pop();
+    if turns.is_empty() {
+        histories.remove(sender_key);
+    }
+    true
 }
 
 fn should_skip_memory_context_entry(key: &str, content: &str) -> bool {
@@ -1324,6 +1487,34 @@ async fn process_channel_message(
         msg.sender,
         truncate_with_ellipsis(&msg.content, 80)
     );
+    runtime_trace::record_event(
+        "channel_message_inbound",
+        Some(msg.channel.as_str()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        serde_json::json!({
+            "sender": msg.sender,
+            "message_id": msg.id,
+            "reply_target": msg.reply_target,
+            "content_preview": truncate_with_ellipsis(&msg.content, 160),
+        }),
+    );
+
+    // ── Hook: on_message_received (modifying) ────────────
+    let msg = if let Some(hooks) = &ctx.hooks {
+        match hooks.run_on_message_received(msg).await {
+            crate::hooks::HookResult::Cancel(reason) => {
+                tracing::info!(%reason, "incoming message dropped by hook");
+                return;
+            }
+            crate::hooks::HookResult::Continue(modified) => modified,
+        }
+    } else {
+        msg
+    };
 
     let target_channel = ctx.channels_by_name.get(&msg.channel).cloned();
     if let Err(err) = maybe_apply_runtime_config_update(ctx.as_ref()).await {
@@ -1410,6 +1601,14 @@ async fn process_channel_message(
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
 
+    tracing::debug!(
+        channel = %msg.channel,
+        has_target_channel = target_channel.is_some(),
+        use_streaming,
+        supports_draft = target_channel.as_ref().map_or(false, |ch| ch.supports_draft_updates()),
+        "Draft streaming decision"
+    );
+
     let (delta_tx, delta_rx) = if use_streaming {
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(64);
         (Some(tx), Some(rx))
@@ -1449,6 +1648,10 @@ async fn process_channel_message(
         Some(tokio::spawn(async move {
             let mut accumulated = String::new();
             while let Some(delta) = rx.recv().await {
+                if delta == crate::agent::loop_::DRAFT_CLEAR_SENTINEL {
+                    accumulated.clear();
+                    continue;
+                }
                 accumulated.push_str(&delta);
                 if let Err(e) = channel
                     .update_draft(&reply_target, &draft_id, &accumulated)
@@ -1461,6 +1664,16 @@ async fn process_channel_message(
     } else {
         None
     };
+
+    // React with 👀 to acknowledge the incoming message
+    if let Some(channel) = target_channel.as_ref() {
+        if let Err(e) = channel
+            .add_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+            .await
+        {
+            tracing::debug!("Failed to add reaction: {e}");
+        }
+    }
 
     let typing_cancellation = target_channel.as_ref().map(|_| CancellationToken::new());
     let typing_task = match (target_channel.as_ref(), typing_cancellation.as_ref()) {
@@ -1501,6 +1714,12 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                ctx.hooks.as_deref(),
+                if msg.channel == "cli" {
+                    &[]
+                } else {
+                    ctx.non_cli_excluded_tools.as_ref()
+                },
             ),
         ) => LlmExecutionResult::Completed(result),
     };
@@ -1516,12 +1735,30 @@ async fn process_channel_message(
         log_worker_join_result(handle.await);
     }
 
+    let reaction_done_emoji = match &llm_result {
+        LlmExecutionResult::Completed(Ok(Ok(_))) => "\u{2705}", // ✅
+        _ => "\u{26A0}\u{FE0F}",                                // ⚠️
+    };
+
     match llm_result {
         LlmExecutionResult::Cancelled => {
             tracing::info!(
                 channel = %msg.channel,
                 sender = %msg.sender,
                 "Cancelled in-flight channel request due to newer message"
+            );
+            runtime_trace::record_event(
+                "channel_message_cancelled",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some("cancelled due to newer inbound message"),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
             );
             if let (Some(channel), Some(draft_id)) =
                 (target_channel.as_ref(), draft_message_id.as_deref())
@@ -1532,20 +1769,93 @@ async fn process_channel_message(
             }
         }
         LlmExecutionResult::Completed(Ok(Ok(response))) => {
+            // ── Hook: on_message_sending (modifying) ─────────
+            let mut outbound_response = response;
+            if let Some(hooks) = &ctx.hooks {
+                match hooks
+                    .run_on_message_sending(
+                        msg.channel.clone(),
+                        msg.reply_target.clone(),
+                        outbound_response.clone(),
+                    )
+                    .await
+                {
+                    crate::hooks::HookResult::Cancel(reason) => {
+                        tracing::info!(%reason, "outgoing message suppressed by hook");
+                        return;
+                    }
+                    crate::hooks::HookResult::Continue((
+                        hook_channel,
+                        hook_recipient,
+                        mut modified_content,
+                    )) => {
+                        if hook_channel != msg.channel || hook_recipient != msg.reply_target {
+                            tracing::warn!(
+                                from_channel = %msg.channel,
+                                from_recipient = %msg.reply_target,
+                                to_channel = %hook_channel,
+                                to_recipient = %hook_recipient,
+                                "on_message_sending attempted to rewrite channel routing; only content mutation is applied"
+                            );
+                        }
+
+                        let modified_len = modified_content.chars().count();
+                        if modified_len > CHANNEL_HOOK_MAX_OUTBOUND_CHARS {
+                            tracing::warn!(
+                                limit = CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                                attempted = modified_len,
+                                "hook-modified outbound content exceeded limit; truncating"
+                            );
+                            modified_content = truncate_with_ellipsis(
+                                &modified_content,
+                                CHANNEL_HOOK_MAX_OUTBOUND_CHARS,
+                            );
+                        }
+
+                        if modified_content != outbound_response {
+                            tracing::info!(
+                                channel = %msg.channel,
+                                sender = %msg.sender,
+                                before_len = outbound_response.chars().count(),
+                                after_len = modified_content.chars().count(),
+                                "outgoing message content modified by hook"
+                            );
+                        }
+
+                        outbound_response = modified_content;
+                    }
+                }
+            }
+
             let sanitized_response =
-                sanitize_channel_response(&response, ctx.tools_registry.as_ref());
-            let delivered_response = if sanitized_response.is_empty() && !response.trim().is_empty()
+                sanitize_channel_response(&outbound_response, ctx.tools_registry.as_ref());
+            let delivered_response = if sanitized_response.is_empty()
+                && !outbound_response.trim().is_empty()
             {
                 "I encountered malformed tool-call output and could not produce a safe reply. Please try again.".to_string()
             } else {
                 sanitized_response
             };
+            runtime_trace::record_event(
+                "channel_message_outbound",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(true),
+                None,
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                    "response": scrub_credentials(&delivered_response),
+                }),
+            );
 
             // Extract condensed tool-use context from the history messages
             // added during run_tool_call_loop, so the LLM retains awareness
             // of what it did on subsequent turns.
             let tool_summary = extract_tool_context_summary(&history, history_len_before_tools);
-            let history_response = if tool_summary.is_empty() {
+            let history_response = if tool_summary.is_empty() || msg.channel == "telegram" {
                 delivered_response.clone()
             } else {
                 format!("{tool_summary}\n{delivered_response}")
@@ -1594,6 +1904,19 @@ async fn process_channel_message(
                     sender = %msg.sender,
                     "Cancelled in-flight channel request due to newer message"
                 );
+                runtime_trace::record_event(
+                    "channel_message_cancelled",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("cancelled during tool-call loop"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
                 if let (Some(channel), Some(draft_id)) =
                     (target_channel.as_ref(), draft_message_id.as_deref())
                 {
@@ -1601,10 +1924,7 @@ async fn process_channel_message(
                         tracing::debug!("Failed to cancel draft on {}: {err}", channel.name());
                     }
                 }
-                return;
-            }
-
-            if is_context_window_overflow_error(&e) {
+            } else if is_context_window_overflow_error(&e) {
                 let compacted = compact_sender_history(ctx.as_ref(), &history_key);
                 let error_text = if compacted {
                     "⚠️ Context window exceeded for this conversation. I compacted recent history and kept the latest context. Please resend your last message."
@@ -1615,6 +1935,20 @@ async fn process_channel_message(
                     "  ⚠️ Context window exceeded after {}ms; sender history compacted={}",
                     started_at.elapsed().as_millis(),
                     compacted
+                );
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some("context window exceeded"),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                        "history_compacted": compacted,
+                    }),
                 );
                 if let Some(channel) = target_channel.as_ref() {
                     if let Some(ref draft_id) = draft_message_id {
@@ -1630,25 +1964,53 @@ async fn process_channel_message(
                             .await;
                     }
                 }
-                return;
-            }
+            } else {
+                eprintln!(
+                    "  ❌ LLM error after {}ms: {e}",
+                    started_at.elapsed().as_millis()
+                );
+                let safe_error = providers::sanitize_api_error(&e.to_string());
+                runtime_trace::record_event(
+                    "channel_message_error",
+                    Some(msg.channel.as_str()),
+                    Some(route.provider.as_str()),
+                    Some(route.model.as_str()),
+                    None,
+                    Some(false),
+                    Some(&safe_error),
+                    serde_json::json!({
+                        "sender": msg.sender,
+                        "elapsed_ms": started_at.elapsed().as_millis(),
+                    }),
+                );
+                let should_rollback_user_turn = e
+                    .downcast_ref::<providers::ProviderCapabilityError>()
+                    .is_some_and(|capability| capability.capability.eq_ignore_ascii_case("vision"));
+                let rolled_back = should_rollback_user_turn
+                    && rollback_orphan_user_turn(ctx.as_ref(), &history_key, &msg.content);
 
-            eprintln!(
-                "  ❌ LLM error after {}ms: {e}",
-                started_at.elapsed().as_millis()
-            );
-            if let Some(channel) = target_channel.as_ref() {
-                if let Some(ref draft_id) = draft_message_id {
-                    let _ = channel
-                        .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
-                        .await;
-                } else {
-                    let _ = channel
-                        .send(
-                            &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
-                                .in_thread(msg.thread_ts.clone()),
-                        )
-                        .await;
+                if !rolled_back {
+                    // Close the orphan user turn so subsequent messages don't
+                    // inherit this failed request as unfinished context.
+                    append_sender_turn(
+                        ctx.as_ref(),
+                        &history_key,
+                        ChatMessage::assistant("[Task failed — not continuing this request]"),
+                    );
+                }
+                if let Some(channel) = target_channel.as_ref() {
+                    if let Some(ref draft_id) = draft_message_id {
+                        let _ = channel
+                            .finalize_draft(&msg.reply_target, draft_id, &format!("⚠️ Error: {e}"))
+                            .await;
+                    } else {
+                        let _ = channel
+                            .send(
+                                &SendMessage::new(format!("⚠️ Error: {e}"), &msg.reply_target)
+                                    .in_thread(msg.thread_ts.clone()),
+                            )
+                            .await;
+                    }
                 }
             }
         }
@@ -1657,10 +2019,30 @@ async fn process_channel_message(
                 "LLM response timed out after {}s (base={}s, max_tool_iterations={})",
                 timeout_budget_secs, ctx.message_timeout_secs, ctx.max_tool_iterations
             );
+            runtime_trace::record_event(
+                "channel_message_timeout",
+                Some(msg.channel.as_str()),
+                Some(route.provider.as_str()),
+                Some(route.model.as_str()),
+                None,
+                Some(false),
+                Some(&timeout_msg),
+                serde_json::json!({
+                    "sender": msg.sender,
+                    "elapsed_ms": started_at.elapsed().as_millis(),
+                }),
+            );
             eprintln!(
                 "  ❌ {} (elapsed: {}ms)",
                 timeout_msg,
                 started_at.elapsed().as_millis()
+            );
+            // Close the orphan user turn so subsequent messages don't
+            // inherit this timed-out request as unfinished context.
+            append_sender_turn(
+                ctx.as_ref(),
+                &history_key,
+                ChatMessage::assistant("[Task timed out — not continuing this request]"),
             );
             if let Some(channel) = target_channel.as_ref() {
                 let error_text =
@@ -1679,6 +2061,16 @@ async fn process_channel_message(
                 }
             }
         }
+    }
+
+    // Swap 👀 → ✅ (or ⚠️ on error) to signal processing is complete
+    if let Some(channel) = target_channel.as_ref() {
+        let _ = channel
+            .remove_reaction(&msg.reply_target, &msg.id, "\u{1F440}")
+            .await;
+        let _ = channel
+            .add_reaction(&msg.reply_target, &msg.id, reaction_done_emoji)
+            .await;
     }
 }
 
@@ -1955,8 +2347,12 @@ pub fn build_system_prompt_with_mode(
 
     // ── 6. Date & Time ──────────────────────────────────────────
     let now = chrono::Local::now();
-    let tz = now.format("%Z").to_string();
-    let _ = writeln!(prompt, "## Current Date & Time\n\nTimezone: {tz}\n");
+    let _ = writeln!(
+        prompt,
+        "## Current Date & Time\n\n{} ({})\n",
+        now.format("%Y-%m-%d %H:%M:%S"),
+        now.format("%Z")
+    );
 
     // ── 7. Runtime ──────────────────────────────────────────────
     let host =
@@ -2178,7 +2574,7 @@ fn maybe_restart_managed_daemon_service() -> Result<bool> {
     Ok(false)
 }
 
-pub async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
+pub(crate) async fn handle_command(command: crate::ChannelCommands, config: &Config) -> Result<()> {
     match command {
         crate::ChannelCommands::Start => {
             anyhow::bail!("Start must be handled in main.rs (requires async runtime)")
@@ -2215,6 +2611,8 @@ pub async fn handle_command(command: crate::ChannelCommands, config: &Config) ->
                 ),
                 ("DingTalk", config.channels_config.dingtalk.is_some()),
                 ("QQ", config.channels_config.qq.is_some()),
+                ("Nostr", config.channels_config.nostr.is_some()),
+                ("ClawdTalk", config.channels_config.clawdtalk.is_some()),
             ] {
                 println!("  {} {name}", if configured { "✅" } else { "❌" });
             }
@@ -2287,7 +2685,9 @@ fn collect_configured_channels(
                     tg.allowed_users.clone(),
                     tg.mention_only,
                 )
-                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms),
+                .with_streaming(tg.stream_mode, tg.draft_update_interval_ms)
+                .with_transcription(config.transcription.clone())
+                .with_workspace_dir(config.workspace_dir.clone()),
             ),
         });
     }
@@ -2341,13 +2741,14 @@ fn collect_configured_channels(
     if let Some(ref mx) = config.channels_config.matrix {
         channels.push(ConfiguredChannel {
             display_name: "Matrix",
-            channel: Arc::new(MatrixChannel::new_with_session_hint(
+            channel: Arc::new(MatrixChannel::new_with_session_hint_and_zeroclaw_dir(
                 mx.homeserver.clone(),
                 mx.access_token.clone(),
                 mx.room_id.clone(),
                 mx.allowed_users.clone(),
                 mx.user_id.clone(),
                 mx.device_id.clone(),
+                config.config_path.parent().map(|path| path.to_path_buf()),
             )),
         });
     }
@@ -2509,12 +2910,28 @@ fn collect_configured_channels(
         });
     }
 
+    if let Some(ref ct) = config.channels_config.clawdtalk {
+        channels.push(ConfiguredChannel {
+            display_name: "ClawdTalk",
+            channel: Arc::new(ClawdTalkChannel::new(ct.clone())),
+        });
+    }
+
     channels
 }
 
 /// Run health checks for configured channels.
 pub async fn doctor_channels(config: Config) -> Result<()> {
-    let channels = collect_configured_channels(&config, "health check");
+    let mut channels = collect_configured_channels(&config, "health check");
+
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push(ConfiguredChannel {
+            display_name: "Nostr",
+            channel: Arc::new(
+                NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+            ),
+        });
+    }
 
     if channels.is_empty() {
         println!("No real-time channels configured. Run `zeroclaw onboard` first.");
@@ -2700,6 +3117,13 @@ pub async fn start_channels(config: Config) -> Result<()> {
         ));
     }
 
+    // Filter out tools excluded for non-CLI channels so the system prompt
+    // does not advertise them for channel-driven runs.
+    let excluded = &config.autonomy.non_cli_excluded_tools;
+    if !excluded.is_empty() {
+        tool_descs.retain(|(name, _)| !excluded.iter().any(|ex| ex == name));
+    }
+
     let bootstrap_max_chars = if config.agent.compact_context {
         Some(6000)
     } else {
@@ -2732,11 +3156,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
     }
 
     // Collect active channels from a shared builder to keep startup and doctor parity.
-    let channels: Vec<Arc<dyn Channel>> = collect_configured_channels(&config, "runtime startup")
-        .into_iter()
-        .map(|configured| configured.channel)
-        .collect();
+    let mut channels: Vec<Arc<dyn Channel>> =
+        collect_configured_channels(&config, "runtime startup")
+            .into_iter()
+            .map(|configured| configured.channel)
+            .collect();
 
+    if let Some(ref ns) = config.channels_config.nostr {
+        channels.push(Arc::new(
+            NostrChannel::new(&ns.private_key, ns.relays.clone(), &ns.allowed_pubkeys).await?,
+        ));
+    }
     if channels.is_empty() {
         println!("No channels configured. Run `zeroclaw onboard` to set up channels.");
         return Ok(());
@@ -2835,6 +3265,16 @@ pub async fn start_channels(config: Config) -> Result<()> {
         message_timeout_secs,
         interrupt_on_new_message,
         multimodal: config.multimodal.clone(),
+        hooks: if config.hooks.enabled {
+            let mut runner = crate::hooks::HookRunner::new();
+            if config.hooks.builtin.command_logger {
+                runner.register(Box::new(crate::hooks::builtin::CommandLoggerHook::new()));
+            }
+            Some(Arc::new(runner))
+        } else {
+            None
+        },
+        non_cli_excluded_tools: Arc::new(config.autonomy.non_cli_excluded_tools.clone()),
     });
 
     run_message_dispatch_loop(rx, runtime_ctx, max_in_flight_messages).await;
@@ -2968,6 +3408,42 @@ mod tests {
         assert!(normalized[1].content.contains("assistant part 2"));
     }
 
+    /// Verify that an orphan user turn followed by a failure-marker assistant
+    /// turn normalizes correctly, so the LLM sees the failed request as closed
+    /// and does not re-execute it on the next user message.
+    #[test]
+    fn normalize_preserves_failure_marker_after_orphan_user_turn() {
+        let turns = vec![
+            ChatMessage::user("download something from GitHub"),
+            ChatMessage::assistant("[Task failed — not continuing this request]"),
+            ChatMessage::user("what is WAL?"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[0].role, "user");
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.contains("Task failed"));
+        assert_eq!(normalized[2].role, "user");
+        assert_eq!(normalized[2].content, "what is WAL?");
+    }
+
+    /// Same as above but for the timeout variant.
+    #[test]
+    fn normalize_preserves_timeout_marker_after_orphan_user_turn() {
+        let turns = vec![
+            ChatMessage::user("run a long task"),
+            ChatMessage::assistant("[Task timed out — not continuing this request]"),
+            ChatMessage::user("next question"),
+        ];
+
+        let normalized = normalize_cached_channel_turns(turns);
+        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized[1].role, "assistant");
+        assert!(normalized[1].content.contains("Task timed out"));
+        assert_eq!(normalized[2].content, "next question");
+    }
+
     #[test]
     fn compact_sender_history_keeps_recent_truncated_messages() {
         let mut histories = HashMap::new();
@@ -3007,9 +3483,11 @@ mod tests {
             reliability: Arc::new(crate::config::ReliabilityConfig::default()),
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
             provider_runtime_options: providers::ProviderRuntimeOptions::default(),
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         };
 
         assert!(compact_sender_history(&ctx, &sender));
@@ -3028,6 +3506,103 @@ mod tests {
                 || (len <= CHANNEL_HISTORY_COMPACT_CONTENT_CHARS + 3
                     && turn.content.ends_with("..."))
         }));
+    }
+
+    #[test]
+    fn append_sender_turn_stores_single_turn_per_call() {
+        let sender = "telegram_u2".to_string();
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        };
+
+        append_sender_turn(&ctx, &sender, ChatMessage::user("hello"));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories.get(&sender).expect("sender history should exist");
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "hello");
+    }
+
+    #[test]
+    fn rollback_orphan_user_turn_removes_only_latest_matching_user_turn() {
+        let sender = "telegram_u3".to_string();
+        let mut histories = HashMap::new();
+        histories.insert(
+            sender.clone(),
+            vec![
+                ChatMessage::user("first"),
+                ChatMessage::assistant("ok"),
+                ChatMessage::user("pending"),
+            ],
+        );
+        let ctx = ChannelRuntimeContext {
+            channels_by_name: Arc::new(HashMap::new()),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("system".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(histories)),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        };
+
+        assert!(rollback_orphan_user_turn(&ctx, &sender, "pending"));
+
+        let histories = ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get(&sender)
+            .expect("sender history should remain");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].content, "first");
+        assert_eq!(turns[1].content, "ok");
     }
 
     struct DummyProvider;
@@ -3050,6 +3625,8 @@ mod tests {
         sent_messages: tokio::sync::Mutex<Vec<String>>,
         start_typing_calls: AtomicUsize,
         stop_typing_calls: AtomicUsize,
+        reactions_added: tokio::sync::Mutex<Vec<(String, String, String)>>,
+        reactions_removed: tokio::sync::Mutex<Vec<(String, String, String)>>,
     }
 
     #[derive(Default)]
@@ -3115,6 +3692,34 @@ mod tests {
 
         async fn stop_typing(&self, _recipient: &str) -> anyhow::Result<()> {
             self.stop_typing_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn add_reaction(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            self.reactions_added.lock().await.push((
+                channel_id.to_string(),
+                message_id.to_string(),
+                emoji.to_string(),
+            ));
+            Ok(())
+        }
+
+        async fn remove_reaction(
+            &self,
+            channel_id: &str,
+            message_id: &str,
+            emoji: &str,
+        ) -> anyhow::Result<()> {
+            self.reactions_removed.lock().await.push((
+                channel_id.to_string(),
+                message_id.to_string(),
+                emoji.to_string(),
+            ));
             Ok(())
         }
     }
@@ -3456,7 +4061,9 @@ BTC is currently around $65,000 based on latest tool output."#
             workspace_dir: Arc::new(std::env::temp_dir()),
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
         });
 
         process_channel_message(
@@ -3480,6 +4087,79 @@ BTC is currently around $65,000 based on latest tool output."#
         assert!(sent_messages[0].contains("BTC is currently around"));
         assert!(!sent_messages[0].contains("\"tool_calls\""));
         assert!(!sent_messages[0].contains("mock_price"));
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_telegram_does_not_persist_tool_summary_prefix() {
+        let channel_impl = Arc::new(TelegramRecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(ToolCallingProvider),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![Box::new(MockPriceTool)]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+        });
+
+        process_channel_message(
+            runtime_ctx.clone(),
+            traits::ChannelMessage {
+                id: "msg-telegram-tool-1".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-telegram".to_string(),
+                content: "What is the BTC price now?".to_string(),
+                channel: "telegram".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent_messages = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent_messages.len(), 1);
+        assert!(sent_messages[0].contains("BTC is currently around"));
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("telegram_alice")
+            .expect("telegram history should be stored");
+        let assistant_turn = turns
+            .iter()
+            .rev()
+            .find(|turn| turn.role == "assistant")
+            .expect("assistant turn should be present");
+        assert!(
+            !assistant_turn.content.contains("[Used tools:"),
+            "telegram history should not persist tool-summary prefix"
+        );
     }
 
     #[tokio::test]
@@ -3514,6 +4194,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3571,6 +4253,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3637,6 +4321,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3724,6 +4410,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3793,6 +4481,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3877,6 +4567,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -3946,6 +4638,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4004,6 +4698,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4173,6 +4869,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(4);
@@ -4251,6 +4949,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4341,6 +5041,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: true,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         let (tx, rx) = tokio::sync::mpsc::channel::<traits::ChannelMessage>(8);
@@ -4413,6 +5115,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4434,6 +5138,77 @@ BTC is currently around $65,000 based on latest tool output."#
         let stops = channel_impl.stop_typing_calls.load(Ordering::SeqCst);
         assert_eq!(starts, 1, "start_typing should be called once");
         assert_eq!(stops, 1, "stop_typing should be called once");
+    }
+
+    #[tokio::test]
+    async fn process_channel_message_adds_and_swaps_reactions() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(SlowProvider {
+                delay: Duration::from_millis(5),
+            }),
+            default_provider: Arc::new("test-provider".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("test-system-prompt".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 10,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "react-msg".to_string(),
+                sender: "alice".to_string(),
+                reply_target: "chat-react".to_string(),
+                content: "hello".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let added = channel_impl.reactions_added.lock().await;
+        assert!(
+            added.len() >= 2,
+            "expected at least 2 reactions added (\u{1F440} then \u{2705}), got {}",
+            added.len()
+        );
+        assert_eq!(added[0].2, "\u{1F440}", "first reaction should be eyes");
+        assert_eq!(
+            added.last().unwrap().2,
+            "\u{2705}",
+            "last reaction should be checkmark"
+        );
+
+        let removed = channel_impl.reactions_removed.lock().await;
+        assert_eq!(removed.len(), 1, "eyes reaction should be removed once");
+        assert_eq!(removed[0].2, "\u{1F440}");
     }
 
     #[test]
@@ -4915,6 +5690,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -4998,6 +5775,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5081,6 +5860,8 @@ BTC is currently around $65,000 based on latest tool output."#
             message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
             interrupt_on_new_message: false,
             multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
         });
 
         process_channel_message(
@@ -5111,10 +5892,12 @@ BTC is currently around $65,000 based on latest tool output."#
             .collect::<Vec<_>>();
         assert_eq!(roles, vec!["system", "user", "assistant", "user"]);
         assert!(
-            calls[0][0]
-                .1
-                .contains("When responding on Telegram, include media markers"),
-            "telegram delivery instruction should live in the system prompt"
+            calls[0][0].1.contains("When responding on Telegram:"),
+            "telegram channel instructions should be embedded into the system prompt"
+        );
+        assert!(
+            calls[0][0].1.contains("For media attachments use markers:"),
+            "telegram media marker guidance should live in the system prompt"
         );
         assert!(!calls[0].iter().skip(1).any(|(role, _)| role == "system"));
     }
@@ -5543,5 +6326,218 @@ This is an example JSON object for profile settings."#;
     fn maybe_restart_daemon_openrc_args_regression() {
         assert_eq!(OPENRC_STATUS_ARGS, ["zeroclaw", "status"]);
         assert_eq!(OPENRC_RESTART_ARGS, ["zeroclaw", "restart"]);
+    }
+
+    #[test]
+    fn normalize_merges_consecutive_user_turns() {
+        let turns = vec![ChatMessage::user("hello"), ChatMessage::user("world")];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content, "hello\n\nworld");
+    }
+
+    #[test]
+    fn normalize_preserves_strict_alternation() {
+        let turns = vec![
+            ChatMessage::user("hello"),
+            ChatMessage::assistant("hi"),
+            ChatMessage::user("bye"),
+        ];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 3);
+        assert_eq!(result[0].content, "hello");
+        assert_eq!(result[1].content, "hi");
+        assert_eq!(result[2].content, "bye");
+    }
+
+    #[test]
+    fn normalize_merges_multiple_consecutive_user_turns() {
+        let turns = vec![
+            ChatMessage::user("a"),
+            ChatMessage::user("b"),
+            ChatMessage::user("c"),
+        ];
+        let result = normalize_cached_channel_turns(turns);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].role, "user");
+        assert_eq!(result[0].content, "a\n\nb\n\nc");
+    }
+
+    #[test]
+    fn normalize_empty_input() {
+        let result = normalize_cached_channel_turns(vec![]);
+        assert!(result.is_empty());
+    }
+
+    // ── E2E: photo [IMAGE:] marker rejected by non-vision provider ───
+
+    /// End-to-end test: a photo attachment message (containing `[IMAGE:]`
+    /// marker) sent through `process_channel_message` with a non-vision
+    /// provider must produce a `"⚠️ Error: …does not support vision"` reply
+    /// on the recording channel — no real Telegram or LLM API required.
+    #[tokio::test]
+    async fn e2e_photo_attachment_rejected_by_non_vision_provider() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        // DummyProvider has default capabilities (vision: false).
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        // Simulate a photo attachment message with [IMAGE:] marker.
+        process_channel_message(
+            runtime_ctx,
+            traits::ChannelMessage {
+                id: "msg-photo-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 1, "expected exactly one reply message");
+        assert!(
+            sent[0].contains("does not support vision"),
+            "reply must mention vision capability error, got: {}",
+            sent[0]
+        );
+        assert!(
+            sent[0].contains("⚠️ Error"),
+            "reply must start with error prefix, got: {}",
+            sent[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn e2e_failed_vision_turn_does_not_poison_follow_up_text_turn() {
+        let channel_impl = Arc::new(RecordingChannel::default());
+        let channel: Arc<dyn Channel> = channel_impl.clone();
+
+        let mut channels_by_name = HashMap::new();
+        channels_by_name.insert(channel.name().to_string(), channel);
+
+        let runtime_ctx = Arc::new(ChannelRuntimeContext {
+            channels_by_name: Arc::new(channels_by_name),
+            provider: Arc::new(DummyProvider),
+            default_provider: Arc::new("dummy".to_string()),
+            memory: Arc::new(NoopMemory),
+            tools_registry: Arc::new(vec![]),
+            observer: Arc::new(NoopObserver),
+            system_prompt: Arc::new("You are a helpful assistant.".to_string()),
+            model: Arc::new("test-model".to_string()),
+            temperature: 0.0,
+            auto_save_memory: false,
+            max_tool_iterations: 5,
+            min_relevance_score: 0.0,
+            conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+            provider_cache: Arc::new(Mutex::new(HashMap::new())),
+            route_overrides: Arc::new(Mutex::new(HashMap::new())),
+            api_key: None,
+            api_url: None,
+            reliability: Arc::new(crate::config::ReliabilityConfig::default()),
+            provider_runtime_options: providers::ProviderRuntimeOptions::default(),
+            workspace_dir: Arc::new(std::env::temp_dir()),
+            message_timeout_secs: CHANNEL_MESSAGE_TIMEOUT_SECS,
+            interrupt_on_new_message: false,
+            multimodal: crate::config::MultimodalConfig::default(),
+            hooks: None,
+            non_cli_excluded_tools: Arc::new(Vec::new()),
+        });
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-photo-1".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "[IMAGE:/tmp/workspace/photo_99_1.jpg]\n\nWhat is this?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 1,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        process_channel_message(
+            Arc::clone(&runtime_ctx),
+            traits::ChannelMessage {
+                id: "msg-text-2".to_string(),
+                sender: "zeroclaw_user".to_string(),
+                reply_target: "chat-photo".to_string(),
+                content: "What is WAL?".to_string(),
+                channel: "test-channel".to_string(),
+                timestamp: 2,
+                thread_ts: None,
+            },
+            CancellationToken::new(),
+        )
+        .await;
+
+        let sent = channel_impl.sent_messages.lock().await;
+        assert_eq!(sent.len(), 2, "expected one error and one successful reply");
+        assert!(
+            sent[0].contains("does not support vision"),
+            "first reply must mention vision capability error, got: {}",
+            sent[0]
+        );
+        assert!(
+            sent[1].ends_with(":ok"),
+            "second reply should succeed for text-only turn, got: {}",
+            sent[1]
+        );
+        drop(sent);
+
+        let histories = runtime_ctx
+            .conversation_histories
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let turns = histories
+            .get("test-channel_zeroclaw_user")
+            .expect("history should exist for sender");
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].role, "user");
+        assert_eq!(turns[0].content, "What is WAL?");
+        assert_eq!(turns[1].role, "assistant");
+        assert_eq!(turns[1].content, "ok");
+        assert!(
+            turns.iter().all(|turn| !turn.content.contains("[IMAGE:")),
+            "failed vision turn must not persist image marker content"
+        );
     }
 }

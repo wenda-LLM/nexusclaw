@@ -11,11 +11,12 @@ This document covers deploying ZeroClaw on a Raspberry Pi or other host on your 
 | **Telegram polling** | No | ZeroClaw polls Telegram API; works from anywhere |
 | **Matrix sync (including E2EE)** | No | ZeroClaw syncs via Matrix client API; no inbound webhook required |
 | **Discord/Slack** | No | Same — outbound only |
+| **Nostr** | No | Connects to relays via WebSocket; outbound only |
 | **Gateway webhook** | Yes | POST /webhook, /whatsapp, /linq, /nextcloud-talk need a public URL |
 | **Gateway pairing** | Yes | If you pair clients via the gateway |
 | **Alpine/OpenRC service** | No | System-wide background service on Alpine Linux |
 
-**Key:** Telegram, Discord, and Slack use **long-polling** — ZeroClaw makes outbound requests. No port forwarding or public IP required.
+**Key:** Telegram, Discord, Slack, and Nostr use **outbound connections** — ZeroClaw connects to external servers/relays. No port forwarding or public IP required.
 
 ---
 
@@ -61,14 +62,14 @@ allowed_users = []
 
 [gateway]
 host = "127.0.0.1"
-port = 3000
+port = 42617
 allow_public_bind = false
 ```
 
 ### 2.4 Run Daemon (Local Only)
 
 ```bash
-zeroclaw daemon --host 127.0.0.1 --port 3000
+zeroclaw daemon --host 127.0.0.1 --port 42617
 ```
 
 - Gateway binds to `127.0.0.1` — not reachable from other machines
@@ -86,12 +87,12 @@ To allow other devices on your LAN to hit the gateway (e.g. for pairing or webho
 ```toml
 [gateway]
 host = "0.0.0.0"
-port = 3000
+port = 42617
 allow_public_bind = true
 ```
 
 ```bash
-zeroclaw daemon --host 0.0.0.0 --port 3000
+zeroclaw daemon --host 0.0.0.0 --port 42617
 ```
 
 **Security:** `allow_public_bind = true` exposes the gateway to your local network. Only use on trusted LANs.
@@ -102,7 +103,7 @@ If you need a **public URL** (e.g. WhatsApp webhook, external clients):
 
 1. Run gateway on localhost:
    ```bash
-   zeroclaw daemon --host 127.0.0.1 --port 3000
+   zeroclaw daemon --host 127.0.0.1 --port 42617
    ```
 
 2. Start a tunnel:
@@ -179,13 +180,13 @@ provider = "ngrok"
 
 Or run ngrok manually:
 ```bash
-ngrok http 3000
+ngrok http 42617
 # Use the HTTPS URL for your webhook
 ```
 
 ### 5.3 Cloudflare Tunnel
 
-Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhook URL to the tunnel's public hostname.
+Configure Cloudflare Tunnel to forward to `127.0.0.1:42617`, then set your webhook URL to the tunnel's public hostname.
 
 ---
 
@@ -193,7 +194,7 @@ Configure Cloudflare Tunnel to forward to `127.0.0.1:3000`, then set your webhoo
 
 - [ ] Build with `--features hardware` (and `peripheral-rpi` if using native GPIO)
 - [ ] Configure `[peripherals]` and `[channels_config.telegram]`
-- [ ] Run `zeroclaw daemon --host 127.0.0.1 --port 3000` (Telegram works without 0.0.0.0)
+- [ ] Run `zeroclaw daemon --host 127.0.0.1 --port 42617` (Telegram works without 0.0.0.0)
 - [ ] For LAN access: `--host 0.0.0.0` + `allow_public_bind = true` in config
 - [ ] For webhooks: use Tailscale, ngrok, or Cloudflare tunnel
 

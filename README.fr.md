@@ -25,7 +25,7 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
 </p>
 
 <p align="center">
-  🌐 <strong>Langues :</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a>
+  🌐 <strong>Langues :</strong> <a href="README.md">English</a> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.ru.md">Русский</a> · <a href="README.fr.md">Français</a> · <a href="README.vi.md">Tiếng Việt</a>
 </p>
 
 <p align="center">
@@ -50,6 +50,10 @@ Construit par des étudiants et membres des communautés Harvard, MIT et Sundai.
   Déployez n'importe où. Échangez n'importe quoi.
 </p>
 
+<p align="center">
+  ZeroClaw est le <strong>système d'exploitation runtime</strong> pour les workflows agentiques — une infrastructure qui abstrait les modèles, outils, mémoire et exécution pour construire des agents une fois et les exécuter partout.
+</p>
+
 <p align="center"><code>Architecture pilotée par traits · runtime sécurisé par défaut · fournisseur/canal/outil interchangeables · tout est pluggable</code></p>
 
 ### 📢 Annonces
@@ -58,8 +62,8 @@ Utilisez ce tableau pour les avis importants (changements incompatibles, avis de
 
 | Date (UTC) | Niveau      | Avis                                                                                                                                                                                                                                                                                                                                                                                                              | Action                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | ---------- | ----------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 2026-02-19 | _Critique_  | Nous ne sommes **pas affiliés** à `openagen/zeroclaw` ou `zeroclaw.org`. Le domaine `zeroclaw.org` pointe actuellement vers le fork `openagen/zeroclaw`, et ce domaine/dépôt usurpe l'identité de notre site web/projet officiel.                                                                                                                                                                                 | Ne faites pas confiance aux informations, binaires, levées de fonds ou annonces provenant de ces sources. Utilisez uniquement ce dépôt et nos comptes sociaux vérifiés.                                                                                                                                                                                                                                                                                                                                                                                                          |
-| 2026-02-19 | _Important_ | Nous n'avons **pas encore** lancé de site web officiel, et nous constatons des tentatives d'usurpation d'identité. Ne participez **pas** à des activités d'investissement ou de levée de fonds revendiquant le nom ZeroClaw.                                                                                                                                                                                      | Utilisez ce dépôt comme source unique de vérité. Suivez [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru), et [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pour les mises à jour officielles. |
+| 2026-02-19 | _Critique_  | Nous ne sommes **pas affiliés** à `openagen/zeroclaw` ou `zeroclaw.org`. Le domaine `zeroclaw.org` pointe actuellement vers le fork `openagen/zeroclaw`, et ce domaine/dépôt usurpe l'identité de notre site web/projet officiel.                                                                                                                                                                                 | Ne faites pas confiance aux informations, binaires, levées de fonds ou annonces provenant de ces sources. Utilisez uniquement [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) et nos comptes sociaux vérifiés.                                                                                                                                                                                                                                                                                                                                                          |
+| 2026-02-21 | _Important_ | Notre site officiel est désormais en ligne : [zeroclawlabs.ai](https://zeroclawlabs.ai). Merci pour votre patience pendant cette attente. Nous constatons toujours des tentatives d'usurpation : ne participez à aucune activité d'investissement/financement au nom de ZeroClaw si elle n'est pas publiée via nos canaux officiels.                                                                                                                   | Utilisez [ce dépôt](https://github.com/zeroclaw-labs/zeroclaw) comme source unique de vérité. Suivez [X (@zeroclawlabs)](https://x.com/zeroclawlabs?s=21), [Reddit (r/zeroclawlabs)](https://www.reddit.com/r/zeroclawlabs/), [Telegram (@zeroclawlabs)](https://t.me/zeroclawlabs), [Telegram CN (@zeroclawlabs_cn)](https://t.me/zeroclawlabs_cn), [Telegram RU (@zeroclawlabs_ru)](https://t.me/zeroclawlabs_ru), et [Xiaohongshu](https://www.xiaohongshu.com/user/profile/67cbfc43000000000d008307?xsec_token=AB73VnYnGNx5y36EtnnZfGmAmS-6Wzv8WMuGpfwfkg6Yc%3D&xsec_source=pc_search) pour les mises à jour officielles. |
 | 2026-02-19 | _Important_ | Anthropic a mis à jour les conditions d'utilisation de l'authentification et des identifiants le 2026-02-19. L'authentification OAuth (Free, Pro, Max) est exclusivement destinée à Claude Code et Claude.ai ; l'utilisation de tokens OAuth de Claude Free/Pro/Max dans tout autre produit, outil ou service (y compris Agent SDK) n'est pas autorisée et peut violer les Conditions d'utilisation grand public. | Veuillez temporairement éviter les intégrations OAuth de Claude Code pour prévenir toute perte potentielle. Clause originale : [Authentication and Credential Use](https://code.claude.com/docs/en/legal-and-compliance#authentication-and-credential-use).                                                                                                                                                                                                                                                                                                                      |
 
 ### ✨ Fonctionnalités
@@ -374,7 +378,7 @@ Voir [Référence des Commandes](docs/commands-reference.md) pour les options et
 - Le runtime abstrait l'exécution de code (natif ou Docker)
 - Aucun verrouillage de fournisseur — échangez Anthropic ↔ OpenAI ↔ Gemini ↔ Ollama sans changement de code
 
-Voir [documentation architecture](docs/architecture.md) pour les diagrammes détaillés et les détails d'implémentation.
+Voir [documentation architecture](docs/architecture.svg) pour les diagrammes détaillés et les détails d'implémentation.
 
 ## Exemples
 
@@ -710,7 +714,7 @@ Utilisateur : Utilise la compétence recherche-web pour trouver les dernières a
 Bot : [charge la compétence recherche-web, exécute web_fetch, résume les résultats]
 ```
 
-Voir [Guide des Compétences](docs/skills-guide.md) pour les instructions de création de compétences complètes.
+Voir la section [Compétences (Skills)](#compétences-skills) pour les instructions de création de compétences complètes.
 
 ## Open Skills
 
