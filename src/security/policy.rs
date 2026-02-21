@@ -605,12 +605,14 @@ impl SecurityPolicy {
                 continue;
             }
 
-            if !self
-                .allowed_commands
-                .iter()
-                .any(|allowed| allowed == base_cmd)
-            {
-                return false;
+            if self.autonomy != AutonomyLevel::Full {
+                if !self
+                    .allowed_commands
+                    .iter()
+                    .any(|allowed| allowed == base_cmd)
+                {
+                    return false;
+                }
             }
 
             // Validate arguments for the command
