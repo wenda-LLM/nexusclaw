@@ -82,7 +82,7 @@ fi
 ensure_bash
 
 install_web_deps() {
-  if [ ! -d "$ROOT_DIR/web" ]; then
+  if [ ! -d "$ROOT_DIR/multitenant-web" ]; then
     return 0
   fi
 
@@ -112,10 +112,10 @@ install_web_deps() {
   fi
 
   echo "==> Installing web dependencies"
-  (cd "$ROOT_DIR/web" && npm install)
+  (cd "$ROOT_DIR/multitenant-web" && npm install)
 
   echo "==> Building web frontend"
-  (cd "$ROOT_DIR/web" && npm run build)
+  (cd "$ROOT_DIR/multitenant-web" && npm run build)
 }
 
 install_web_deps
