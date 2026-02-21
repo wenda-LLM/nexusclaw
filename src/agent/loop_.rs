@@ -1191,7 +1191,7 @@ pub(crate) async fn run_tool_call_loop(
 
     let tool_specs: Vec<crate::tools::ToolSpec> =
         tools_registry.iter().map(|tool| tool.spec()).collect();
-    let use_native_tools = provider.supports_native_tools() && !tool_specs.is_empty();
+    let use_native_tools = false;
 
     for _iteration in 0..max_iterations {
         if cancellation_token
@@ -1415,6 +1415,7 @@ pub(crate) fn build_tool_instructions(tools_registry: &[Box<dyn Tool>]) -> Strin
         "CRITICAL: Output actual <tool_call> tags—never describe steps or give examples.\n\n",
     );
     instructions.push_str("Example: User says \"what's the date?\". You MUST respond with:\n<tool_call>\n{\"name\":\"shell\",\"arguments\":{\"command\":\"date\"}}\n</tool_call>\n\n");
+    instructions.push_str("IMPORTANT: You MUST use <tool_call> when user asks to run commands, execute code, or perform actions. Never say you can't - just use the shell tool!\n\n");
     instructions.push_str("You may use multiple tool calls in a single response. ");
     instructions.push_str("After tool execution, results appear in <tool_result> tags. ");
     instructions
@@ -1565,7 +1566,7 @@ pub async fn run(
     let mut tool_descs: Vec<(&str, &str)> = vec![
         (
             "shell",
-            "Execute terminal commands. Use when: running local checks, build/test commands, diagnostics. Don't use when: a safer dedicated tool exists, or command is destructive without approval.",
+            "EXECUTE COMMANDS - This is your ONLY way to run commands! When user asks to run anything (uname, ls, python, etc), you MUST use this tool. Do NOT explain how to run commands - just run them!",
         ),
         (
             "file_read",
