@@ -30,8 +30,8 @@ venv/
 credentials.json
 .worktrees/
 
-# NexusClaw frontend (upstream synced)
-web/
-
-# Multitenant frontend (separate from upstream web/)
-multitenant-web/
+# Frontend build outputs
+multitenant-web/dist/
+multitenant-web/node_modules/
+web/dist/
+web/node_modules/
