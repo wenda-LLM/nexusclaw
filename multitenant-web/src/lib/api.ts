@@ -24,7 +24,11 @@ async function request<T>(
     throw new Error(error.error || `HTTP ${response.status}`);
   }
 
-  return response.json();
+  const json = await response.json();
+  if (json.data !== undefined) {
+    return json.data as T;
+  }
+  return json as T;
 }
 
 export async function login(credentials: LoginCredentials) {
@@ -52,7 +56,8 @@ export async function logout() {
 }
 
 export async function getCurrentUser() {
-  return request<User>('/auth/me');
+  const data = await request<{ user: User; isAdmin: boolean }>('/auth/me');
+  return data.user;
 }
 
 export async function pairDevice(code: string) {
