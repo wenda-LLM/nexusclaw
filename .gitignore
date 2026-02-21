@@ -30,3 +30,8 @@ venv/
 credentials.json
 .worktrees/
 
+# Frontend build outputs
+multitenant-web/dist/
+multitenant-web/node_modules/
+web/dist/
+web/node_modules/
