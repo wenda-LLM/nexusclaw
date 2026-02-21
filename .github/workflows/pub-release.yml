@@ -3,6 +3,9 @@ name: Pub Release
 on:
     push:
         tags: ["v*"]
+        branches:
+            - main
+            - release/**
     workflow_dispatch:
         inputs:
             release_ref:
@@ -25,6 +28,11 @@ on:
                 required: false
                 default: true
                 type: boolean
+            build_features:
+                description: "Comma-separated features to build (default: all major features)"
+                required: false
+                default: "default,web-ui,multi-tenant"
+                type: string
     schedule:
         # Weekly release-readiness verification on default branch (no publish)
         - cron: "17 8 * * 1"
@@ -44,12 +52,14 @@ env:
 jobs:
     prepare:
         name: Prepare Release Context
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: ubuntu-latest
         outputs:
             release_ref: ${{ steps.vars.outputs.release_ref }}
             release_tag: ${{ steps.vars.outputs.release_tag }}
             publish_release: ${{ steps.vars.outputs.publish_release }}
             draft_release: ${{ steps.vars.outputs.draft_release }}
+            build_features: ${{ steps.vars.outputs.build_features }}
+            is_nexusclaw: ${{ steps.vars.outputs.is_nexusclaw }}
         steps:
             - name: Resolve release inputs
               id: vars
@@ -61,6 +71,11 @@ jobs:
                   publish_release="false"
                   draft_release="false"
                   semver_pattern='^v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'
+                  is_nexusclaw="false"
+
+                  if [[ "$GITHUB_REPOSITORY" == "wenda-LLM/nexusclaw" ]]; then
+                    is_nexusclaw="true"
+                  fi
 
                   if [[ "$event_name" == "push" ]]; then
                     release_ref="${GITHUB_REF_NAME}"
@@ -70,6 +85,7 @@ jobs:
                     release_ref="${{ inputs.release_ref }}"
                     publish_release="${{ inputs.publish_release }}"
                     draft_release="${{ inputs.draft }}"
+                    build_features="${{ inputs.build_features }}"
 
                     if [[ "$publish_release" == "true" ]]; then
                       release_tag="${{ inputs.release_tag }}"
@@ -85,6 +101,7 @@ jobs:
                     # schedule
                     release_ref="main"
                     release_tag="verify-${GITHUB_SHA::12}"
+                    build_features="default"
                   fi
 
                   if [[ "$publish_release" == "true" ]]; then
@@ -114,6 +131,8 @@ jobs:
                     echo "release_tag=${release_tag}"
                     echo "publish_release=${publish_release}"
                     echo "draft_release=${draft_release}"
+                    echo "build_features=${build_features}"
+                    echo "is_nexusclaw=${is_nexusclaw}"
                   } >> "$GITHUB_OUTPUT"
 
                   {
@@ -123,11 +142,48 @@ jobs:
                     echo "- release_tag: ${release_tag}"
                     echo "- publish_release: ${publish_release}"
                     echo "- draft_release: ${draft_release}"
+                    echo "- build_features: ${build_features}"
+                    echo "- is_nexusclaw: ${is_nexusclaw}"
                   } >> "$GITHUB_STEP_SUMMARY"
+
+    build-frontend:
+        name: Build Frontend
+        needs: [prepare]
+        runs-on: ubuntu-latest
+        timeout-minutes: 15
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ needs.prepare.outputs.release_ref }}
+
+            - name: Setup Node.js
+              uses: actions/setup-node@0a6b0dd9f3b2a8d0a4e5e5e5e5e5e5e5e5e5e5e # v4
+              with:
+                  node-version: "22"
+                  cache: "npm"
+                  cache-dependency-path: web/package-lock.json
+
+            - name: Install pnpm
+              uses: pnpm/action-setup@b9a66e5c1edd5f4a4bb3f6c8f3a2e0f3e3c3e3c3 # v5
+              with:
+                  version: 9
+
+            - name: Install dependencies
+              run: cd web && pnpm install --frozen-lockfile
+
+            - name: Build frontend
+              run: cd web && pnpm build
+
+            - name: Upload frontend artifact
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: web-dist
+                  path: web/dist
+                  retention-days: 7
 
     build-release:
         name: Build ${{ matrix.target }}
-        needs: [prepare]
+        needs: [prepare, build-frontend]
         runs-on: ${{ matrix.os }}
         timeout-minutes: 40
         strategy:
@@ -196,6 +252,12 @@ jobs:
                   sudo apt-get update -qq
                   sudo apt-get install -y ${{ matrix.cross_compiler }}
 
+            - name: Download frontend
+              uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+              with:
+                  name: web-dist
+                  path: web/dist
+
             - name: Build release
               shell: bash
               env:
@@ -231,15 +293,80 @@ jobs:
                   path: zeroclaw-${{ matrix.target }}.${{ matrix.archive_ext }}
                   retention-days: 7
 
+    build-nexusclaw-features:
+        name: Build NexusClaw Features
+        needs: [prepare]
+        if: needs.prepare.outputs.is_nexusclaw == 'true'
+        runs-on: ubuntu-latest
+        timeout-minutes: 40
+        strategy:
+            fail-fast: false
+            matrix:
+                include:
+                    - target: x86_64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      features: "hardware,peripheral-rpi"
+                      label: "hardware"
+                    - target: x86_64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      features: "whatsapp-web"
+                      label: "whatsapp"
+                    - target: aarch64-unknown-linux-gnu
+                      artifact: zeroclaw
+                      archive_ext: tar.gz
+                      features: "hardware,peripheral-rpi"
+                      label: "hardware-arm64"
+
+        steps:
+            - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+              with:
+                  ref: ${{ needs.prepare.outputs.release_ref }}
+
+            - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+              with:
+                  toolchain: 1.92.0
+                  targets: ${{ matrix.target }}
+
+            - uses: useblacksmith/rust-cache@f53e7f127245d2a269b3d90879ccf259876842d5 # v3
+
+            - name: Install cross-compilation toolchain
+              run: |
+                  sudo apt-get update -qq
+                  sudo apt-get install -y gcc-aarch64-linux-gnu
+
+            - name: Build release with features
+              shell: bash
+              env:
+                  FEATURES: ${{ matrix.features }}
+              run: |
+                  export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+                  cargo build --profile release-fast --locked --target ${{ matrix.target }} --features "$FEATURES"
+
+            - name: Package
+              run: |
+                  cd target/${{ matrix.target }}/release-fast
+                  tar czf ../../../../zeroclaw-${{ matrix.target }}-${{ matrix.label }}.${{ matrix.archive_ext }} ${{ matrix.artifact }}
+
+            - name: Upload artifact
+              uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+              with:
+                  name: zeroclaw-${{ matrix.target }}-${{ matrix.label }}
+                  path: zeroclaw-${{ matrix.target }}-${{ matrix.label }}.${{ matrix.archive_ext }}
+                  retention-days: 7
+
     verify-artifacts:
         name: Verify Artifact Set
-        needs: [prepare, build-release]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        needs: [prepare, build-release, build-nexusclaw-features]
+        runs-on: ubuntu-latest
         steps:
             - name: Download all artifacts
               uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
               with:
                   path: artifacts
+                  pattern: zeroclaw-*
+                  merge-multiple: true
 
             - name: Validate expected archives
               shell: bash
@@ -268,11 +395,17 @@ jobs:
 
                   echo "All expected release archives are present."
 
+                  # Check NexusClaw-specific artifacts if present
+                  if [ -n "$(find artifacts -type f -name 'zeroclaw-x86_64-unknown-linux-gnu-hardware*' -print -quit)" ]; then
+                    echo "NexusClaw feature builds detected:"
+                    find artifacts -type f \( -name 'zeroclaw-*-hardware*' -o -name 'zeroclaw-*-whatsapp*' \) -exec basename {} \;
+                  fi
+
     publish:
         name: Publish Release
         if: needs.prepare.outputs.publish_release == 'true'
         needs: [prepare, verify-artifacts]
-        runs-on: blacksmith-2vcpu-ubuntu-2404
+        runs-on: ubuntu-latest
         timeout-minutes: 15
         steps:
             - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4

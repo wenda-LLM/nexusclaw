@@ -1,6 +1,14 @@
 # syntax=docker/dockerfile:1.7
 
-# ── Stage 1: Build ────────────────────────────────────────────
+# ── Stage 0: Frontend Build ───────────────────────────────────────
+FROM node:22-alpine AS frontend-builder
+WORKDIR /app/web
+COPY web/package.json web/package-lock.json* ./
+RUN npm install -g pnpm && pnpm install --frozen-lockfile
+COPY web/ ./
+RUN pnpm build
+
+# ── Stage 1: Build ────────────────────────────────────────────────
 FROM rust:1.93-slim@sha256:9663b80a1621253d30b146454f903de48f0af925c967be48c84745537cd35d8b AS builder
 
 WORKDIR /app
@@ -27,6 +35,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
+COPY --from=frontend-builder /app/web/dist web/dist
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/
