@@ -1714,12 +1714,6 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
-                ctx.hooks.as_deref(),
-                if msg.channel == "cli" {
-                    &[]
-                } else {
-                    ctx.non_cli_excluded_tools.as_ref()
-                },
             ),
         ) => LlmExecutionResult::Completed(result),
     };
