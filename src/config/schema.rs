@@ -710,7 +710,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    18789
+    3000
 }
 
 fn default_gateway_host() -> String {
@@ -1713,6 +1713,8 @@ pub struct AutonomyConfig {
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
+    /// Explicit command denylist. Blocks these commands regardless of autonomy level.
+    pub forbidden_commands: Vec<String>,
     /// Explicit path denylist. Default includes system-critical paths.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
@@ -1763,6 +1765,31 @@ impl Default for AutonomyConfig {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
+            ],
+            forbidden_commands: vec![
+                "rm -rf".into(),
+                "mkfs".into(),
+                "dd".into(),
+                "shutdown".into(),
+                "reboot".into(),
+                "halt".into(),
+                "poweroff".into(),
+                "docker".into(),
+                "kubectl".into(),
+                "mount".into(),
+                "umount".into(),
+                "chroot".into(),
+                "iptables".into(),
+                "ufw".into(),
+                "firewall-cmd".into(),
+                "sudo".into(),
+                "su".into(),
+                "passwd".into(),
+                "useradd".into(),
+                "userdel".into(),
+                "usermod".into(),
+                "groupadd".into(),
+                "groupdel".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
@@ -3927,6 +3954,7 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
+            workspace_base: None,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
@@ -3949,6 +3977,7 @@ default_temperature = 0.7
                 block_high_risk_commands: true,
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
+                ..Default::default()
             },
             runtime: RuntimeConfig {
                 kind: "docker".into(),
@@ -4142,6 +4171,7 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
+            workspace_base: None,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),

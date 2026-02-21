@@ -1400,6 +1400,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1445,6 +1446,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer,
+            tools_registry: Arc::new(vec![]),
         };
 
         let response = handle_metrics(State(state)).await.into_response();
@@ -1807,6 +1809,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let mut headers = HeaderMap::new();
@@ -1867,6 +1870,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let headers = HeaderMap::new();
@@ -1939,6 +1943,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let response = handle_webhook(
@@ -1983,6 +1988,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let mut headers = HeaderMap::new();
@@ -2032,6 +2038,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let mut headers = HeaderMap::new();
@@ -2086,6 +2093,7 @@ mod tests {
             nextcloud_talk: None,
             nextcloud_talk_webhook_secret: None,
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let response = handle_nextcloud_talk_webhook(
@@ -2136,6 +2144,7 @@ mod tests {
             nextcloud_talk: Some(channel),
             nextcloud_talk_webhook_secret: Some(Arc::from(secret)),
             observer: Arc::new(crate::observability::NoopObserver),
+            tools_registry: Arc::new(vec![]),
         };
 
         let mut headers = HeaderMap::new();

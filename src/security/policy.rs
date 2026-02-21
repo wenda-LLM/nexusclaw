@@ -84,6 +84,7 @@ pub struct SecurityPolicy {
     pub workspace_dir: PathBuf,
     pub workspace_only: bool,
     pub allowed_commands: Vec<String>,
+    pub forbidden_commands: Vec<String>,
     pub forbidden_paths: Vec<String>,
     pub max_actions_per_hour: u32,
     pub max_cost_per_day_cents: u32,
@@ -112,6 +113,31 @@ impl Default for SecurityPolicy {
                 "head".into(),
                 "tail".into(),
                 "date".into(),
+            ],
+            forbidden_commands: vec![
+                "rm -rf".into(),
+                "mkfs".into(),
+                "dd".into(),
+                "shutdown".into(),
+                "reboot".into(),
+                "halt".into(),
+                "poweroff".into(),
+                "docker".into(),
+                "kubectl".into(),
+                "mount".into(),
+                "umount".into(),
+                "chroot".into(),
+                "iptables".into(),
+                "ufw".into(),
+                "firewall-cmd".into(),
+                "sudo".into(),
+                "su".into(),
+                "passwd".into(),
+                "useradd".into(),
+                "userdel".into(),
+                "usermod".into(),
+                "groupadd".into(),
+                "groupdel".into(),
             ],
             forbidden_paths: vec![
                 // System directories (blocked even when workspace_only=false)
@@ -605,6 +631,20 @@ impl SecurityPolicy {
                 continue;
             }
 
+            // Check forbidden commands (works in all autonomy modes including Full)
+            let cmd_lower = cmd_part.to_ascii_lowercase();
+            let base_lower = base_cmd.to_ascii_lowercase();
+            for forbidden in &self.forbidden_commands {
+                let forbidden_lower = forbidden.to_lowercase();
+                if forbidden_lower.contains(' ') {
+                    if cmd_lower.contains(&forbidden_lower) {
+                        return false;
+                    }
+                } else if base_lower == forbidden_lower {
+                    return false;
+                }
+            }
+
             if self.autonomy != AutonomyLevel::Full {
                 if !self
                     .allowed_commands
@@ -790,6 +830,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
+            forbidden_commands: autonomy_config.forbidden_commands.clone(),
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             max_actions_per_hour: autonomy_config.max_actions_per_hour,
             max_cost_per_day_cents: autonomy_config.max_cost_per_day_cents,
@@ -950,11 +991,12 @@ mod tests {
     #[test]
     fn custom_allowlist() {
         let p = SecurityPolicy {
-            allowed_commands: vec!["docker".into(), "kubectl".into()],
+            allowed_commands: vec!["curl".into(), "wget".into()],
+            forbidden_commands: vec![],
             ..SecurityPolicy::default()
         };
-        assert!(p.is_command_allowed("docker ps"));
-        assert!(p.is_command_allowed("kubectl get pods"));
+        assert!(p.is_command_allowed("curl http://example.com"));
+        assert!(p.is_command_allowed("wget http://example.com"));
         assert!(!p.is_command_allowed("ls"));
         assert!(!p.is_command_allowed("git status"));
     }
@@ -1026,6 +1068,7 @@ mod tests {
         let p = SecurityPolicy {
             autonomy: AutonomyLevel::Supervised,
             allowed_commands: vec!["rm".into()],
+            forbidden_commands: vec![],
             ..SecurityPolicy::default()
         };
 

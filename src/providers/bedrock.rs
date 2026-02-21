@@ -25,6 +25,7 @@ const DEFAULT_MAX_TOKENS: u32 = 4096;
 // ── AWS Credentials ─────────────────────────────────────────────
 
 /// Resolved AWS credentials for SigV4 signing.
+#[derive(Clone)]
 struct AwsCredentials {
     access_key_id: String,
     secret_access_key: String,
@@ -492,8 +493,18 @@ impl BedrockProvider {
 
     /// Resolve credentials: use cached if available, otherwise fetch from IMDS.
     async fn resolve_credentials(&self) -> anyhow::Result<AwsCredentials> {
+        if let Some(creds) = &self.credentials {
+            return Ok(creds.clone());
+        }
         if let Ok(creds) = AwsCredentials::from_env() {
             return Ok(creds);
+        }
+        if self.credentials.is_none() {
+            anyhow::bail!(
+                "AWS Bedrock credentials not set. Set AWS_ACCESS_KEY_ID and \
+                 AWS_SECRET_ACCESS_KEY environment variables, or run on an EC2 \
+                 instance with an IAM role attached."
+            );
         }
         AwsCredentials::from_imds().await
     }
