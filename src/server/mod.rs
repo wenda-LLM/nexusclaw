@@ -3,9 +3,9 @@ use crate::tenant::{ContainerManager, GroupStore, TenantStore, UserRole, UserSto
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{ws, Path, State},
+    extract::{Query, ws, Path, State},
     http::{HeaderMap, StatusCode},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
     Json, Router,
 };
@@ -235,9 +235,14 @@ struct TenantPatchRequest {
 }
 
 #[derive(Deserialize)]
+struct WsQuery {
+    pub token: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct GatewayRequest {
     #[serde(rename = "type")]
-    msg_type: String,
+    msg_type: Option<String>,
     id: Option<String>,
     method: Option<String>,
     params: Option<serde_json::Value>,
@@ -669,7 +674,20 @@ fn hash_password(password: &str) -> String {
     format!("{:x}", hasher.finish())
 }
 
-async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> Response<Body> {
+async fn ws_handler(
+    ws: ws::WebSocketUpgrade,
+    Query(params): Query<WsQuery>,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    let query_token = params.token.as_deref().unwrap_or("");
+
+    let authenticated = if !query_token.is_empty() {
+        let users = state.users.read().await;
+        users.validate_session(query_token).is_some()
+    } else {
+        false
+    };
+
     let start_time = state.start_time.elapsed().as_millis() as u64;
     ws.on_upgrade(move |socket| async move {
         let (mut send, mut recv) = socket.split();
@@ -678,10 +696,11 @@ async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> 
             if let Ok(ws::Message::Text(text)) = msg {
                 if let Ok(req) = serde_json::from_str::<GatewayRequest>(&text) {
                     let response = match req.method.as_deref() {
-                        Some("connect") | None if req.msg_type != "req" => {
+                        Some("connect") | None if req.msg_type.as_deref() != Some("req") => {
                             serde_json::json!({
                                 "type": "hello-ok",
                                 "protocol": 3,
+                                "authenticated": authenticated,
                                 "features": {
                                     "methods": [
                                         "agents.list", "chat.history", "chat.send", "chat.abort",
@@ -1327,7 +1346,7 @@ async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> 
                 }
             }
         }
-    })
+    }).into_response()
 }
 
 pub async fn run_server(port: u16, host: &str, data_dir: &std::path::Path) -> Result<()> {

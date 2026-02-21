@@ -13,6 +13,8 @@ class GatewayClient {
   private onConnectCallback: (() => void) | null = null;
   private onDisconnectCallback: (() => void) | null = null;
 
+  private pendingRequests: Array<() => void> = [];
+
   connect(url: string, token: string) {
     this.url = url;
     this.token = token;
@@ -28,6 +30,10 @@ class GatewayClient {
       this.ws.onopen = () => {
         this.isConnected = true;
         this.onConnectCallback?.();
+        while (this.pendingRequests.length > 0) {
+          const fn = this.pendingRequests.shift();
+          fn?.();
+        }
         if (this.reconnectTimer) {
           clearTimeout(this.reconnectTimer);
           this.reconnectTimer = null;
@@ -98,8 +104,21 @@ class GatewayClient {
   }
 
   async request<T = unknown>(method: string, params?: Record<string, unknown>): Promise<T> {
+    if (!this.ws || (this.ws.readyState !== WebSocket.OPEN && this.ws.readyState !== WebSocket.CONNECTING)) {
+      this.createConnection();
+    }
+
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error('WebSocket not connected');
+      return new Promise((resolve, reject) => {
+        const executeWhenConnected = () => {
+          if (this.ws?.readyState === WebSocket.OPEN) {
+            this.request<T>(method, params).then(resolve).catch(reject);
+          } else {
+            this.pendingRequests.push(() => executeWhenConnected());
+          }
+        };
+        executeWhenConnected();
+      });
     }
 
     const id = `msg_${++this.messageId}`;
