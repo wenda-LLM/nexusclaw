@@ -2,10 +2,10 @@
 
 # ── Stage 0: Frontend Build ───────────────────────────────────────
 FROM node:22-alpine AS frontend-builder
-WORKDIR /app/web
-COPY web/package.json web/package-lock.json* ./
+WORKDIR /app/multitenant-web
+COPY multitenant-web/package.json multitenant-web/package-lock.json* ./
 RUN npm install -g pnpm && pnpm install --frozen-lockfile
-COPY web/ ./
+COPY multitenant-web/ ./
 RUN pnpm build
 
 # ── Stage 1: Build ────────────────────────────────────────────────
@@ -35,7 +35,7 @@ RUN --mount=type=cache,id=zeroclaw-cargo-registry,target=/usr/local/cargo/regist
 RUN rm -rf src benches crates/robot-kit/src
 
 # 2. Copy only build-relevant source paths (avoid cache-busting on docs/tests/scripts)
-COPY --from=frontend-builder /app/web/dist web/dist
+COPY --from=frontend-builder /app/multitenant-web/dist multitenant-web/dist
 COPY src/ src/
 COPY benches/ benches/
 COPY crates/ crates/

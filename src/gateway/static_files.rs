@@ -9,7 +9,7 @@ use axum::{
 use rust_embed::Embed;
 
 #[derive(Embed)]
-#[folder = "web/dist/"]
+#[folder = "multitenant-web/dist/"]
 struct WebAssets;
 
 /// Serve static files from `/_app/*` path

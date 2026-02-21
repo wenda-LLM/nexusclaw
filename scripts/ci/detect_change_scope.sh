@@ -85,7 +85,7 @@ while IFS= read -r file; do
     rust_changed=true
   fi
 
-  if [[ "$file" == web/* ]]; then
+  if [[ "$file" == multitenant-web/* ]]; then
     frontend_changed=true
   fi
 done <<< "$CHANGED"
