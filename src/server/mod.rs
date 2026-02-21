@@ -1112,6 +1112,32 @@ async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> 
                                 "payload": { "nodes": [] }
                             })
                         }
+                        Some("system-presence") => {
+                            let config_guard = state.config.read().await;
+                            let mode = config_guard.as_ref()
+                                .map(|c| if c.gateway.require_pairing { "paired" } else { "open" })
+                                .unwrap_or("open");
+                            serde_json::json!({
+                                "type": "res",
+                                "id": req.id,
+                                "ok": true,
+                                "payload": [{
+                                    "host": "localhost",
+                                    "mode": mode,
+                                    "roles": ["node"],
+                                    "scopes": ["operator.admin", "operator.approvals", "operator.pairing"],
+                                    "version": env!("CARGO_PKG_VERSION")
+                                }]
+                            })
+                        }
+                        Some("node.list") => {
+                            serde_json::json!({
+                                "type": "res",
+                                "id": req.id,
+                                "ok": true,
+                                "payload": { "nodes": [] }
+                            })
+                        }
                         Some("logs.tail") => {
                             serde_json::json!({
                                 "type": "res",
@@ -1173,7 +1199,7 @@ async fn ws_handler(ws: ws::WebSocketUpgrade, State(state): State<AppState>) -> 
                             let params = req.params.unwrap_or(serde_json::json!({}));
                             let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
                             
-                            let tenant_id = params.get("tenant_id").and_then(|v| v.as_str()).unwrap_or("default");
+                            let tenant_id = params.get("tenant_id").or(params.get("session")).and_then(|v| v.as_str()).unwrap_or("default");
                             tracing::info!(tenant_id = tenant_id, message = message, "chat.send received");
                             
                             let run_id = format!("run_{}", Uuid::new_v4().to_string().replace("-", "")[..8].to_string());
