@@ -29,3 +29,9 @@ venv/
 *.pem
 credentials.json
 .worktrees/
+
+# NexusClaw frontend (upstream synced)
+web/
+
+# Multitenant frontend (separate from upstream web/)
+multitenant-web/
