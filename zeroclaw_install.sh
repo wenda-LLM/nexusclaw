@@ -81,6 +81,45 @@ fi
 
 ensure_bash
 
+install_web_deps() {
+  if [ ! -d "$ROOT_DIR/web" ]; then
+    return 0
+  fi
+
+  if ! have_cmd node; then
+    echo "==> node not found; attempting to install it"
+    if have_cmd apk; then
+      run_privileged apk add --no-cache nodejs npm
+    elif have_cmd apt-get; then
+      run_privileged apt-get update -qq
+      run_privileged apt-get install -y nodejs npm
+    elif have_cmd dnf; then
+      run_privileged dnf install -y nodejs npm
+    elif have_cmd pacman; then
+      run_pacman -Sy --noconfirm
+      run_pacman -S --noconfirm --needed nodejs npm
+    elif have_cmd brew; then
+      run_privileged brew install node
+    else
+      echo "warning: unsupported package manager; install node.js manually and retry." >&2
+      return 1
+    fi
+  fi
+
+  if ! have_cmd npm; then
+    echo "warning: npm not found; cannot install web dependencies." >&2
+    return 1
+  fi
+
+  echo "==> Installing web dependencies"
+  (cd "$ROOT_DIR/web" && npm install)
+
+  echo "==> Building web frontend"
+  (cd "$ROOT_DIR/web" && npm run build)
+}
+
+install_web_deps
+
 if [ "$#" -eq 0 ]; then
   exec bash "$BOOTSTRAP_SCRIPT" --guided
 fi
