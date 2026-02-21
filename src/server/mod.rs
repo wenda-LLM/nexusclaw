@@ -261,16 +261,22 @@ async fn login(
                 u.email.clone(),
                 u.role.clone(),
                 u.password_hash.clone(),
+                u.display_name.clone().unwrap_or_default(),
             )
         })
     };
 
-    if let Some((user_id, user_email, user_role, password_hash)) = user_data {
+    if let Some((user_id, user_email, user_role, password_hash, user_name)) = user_data {
         if verify_password(&req.password, &password_hash) {
             let mut usersw = state.users.write().await;
-            if let Ok(session) = usersw.create_session(user_id, 604800) {
+            if let Ok(session) = usersw.create_session(user_id.clone(), 604800) {
+                let role_str = match user_role {
+                    UserRole::Admin => "admin",
+                    UserRole::Owner => "admin",
+                    _ => "user",
+                };
                 return Json(ApiResponse::ok(
-                    serde_json::json!({ "token": session.token, "user": { "email": user_email, "role": format!("{:?}", user_role) } }),
+                    serde_json::json!({ "token": session.token, "user": { "email": user_email, "role": role_str, "id": user_id, "name": user_name } }),
                 ));
             }
         }
@@ -323,14 +329,20 @@ async fn get_me(
         let users = state.users.read().await;
         if let Some(session) = users.validate_session(token) {
             if let Some(user) = users.get(&session.user_id) {
+                let role_lower = match user.role {
+                    crate::tenant::UserRole::Admin => "admin",
+                    crate::tenant::UserRole::Owner => "admin",
+                    _ => "user",
+                };
                 return Json(ApiResponse::ok(serde_json::json!({
                     "user": {
                         "email": user.email,
-                        "role": format!("{:?}", user.role),
+                        "role": role_lower,
                         "id": user.id,
+                        "name": user.display_name.clone().unwrap_or_default(),
                         "tenant_id": user.tenant_id
                     },
-                    "isAdmin": format!("{:?}", user.role) == "Admin"
+                    "isAdmin": role_lower == "admin"
                 })));
             }
         }
