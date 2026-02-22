@@ -3,7 +3,7 @@ use crate::tenant::{ContainerManager, GroupStore, TenantStore, UserRole, UserSto
 use anyhow::Result;
 use axum::{
     body::Body,
-    extract::{Query, ws, Path, State},
+    extract::{ws, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post},
@@ -647,7 +647,8 @@ async fn handle_chat_proxy(Json(req): Json<ChatRequest>) -> Response<Body> {
         }
     };
 
-    match crate::agent::loop_::run(config, Some(req.message), None, None, 0.7, vec![]).await {
+    match crate::agent::loop_::run(config, Some(req.message), None, None, 0.7, vec![], false).await
+    {
         Ok(response) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "application/json")
@@ -691,7 +692,7 @@ async fn ws_handler(
     let start_time = state.start_time.elapsed().as_millis() as u64;
     ws.on_upgrade(move |socket| async move {
         let (mut send, mut recv) = socket.split();
-        
+
         while let Some(msg) = recv.next().await {
             if let Ok(ws::Message::Text(text)) = msg {
                 if let Ok(req) = serde_json::from_str::<GatewayRequest>(&text) {
@@ -752,9 +753,9 @@ async fn ws_handler(
                         }
                         Some("config.set") => {
                             let params = req.params.unwrap_or(serde_json::json!({}));
-                            
+
                             let raw = params.get("raw").and_then(|v| v.as_str());
-                            
+
                             if let Some(raw_content) = raw {
                                 let mut config_guard = state.config.write().await;
                                 if let Some(config) = config_guard.as_mut() {
@@ -765,7 +766,7 @@ async fn ws_handler(
                                         let mut hasher = Sha256::new();
                                         hasher.update(current_raw.as_bytes());
                                         let current_hash = format!("{:x}", hasher.finalize());
-                                        
+
                                         if current_hash != expected_hash {
                                             serde_json::json!({
                                                 "type": "res",
@@ -849,7 +850,7 @@ async fn ws_handler(
                                     if let Some(temp) = config_obj.get("default_temperature").and_then(|v| v.as_f64()) {
                                         config.default_temperature = temp;
                                     }
-                                    
+
                                     if let Err(e) = config.save().await {
                                         serde_json::json!({
                                             "type": "res",
@@ -893,7 +894,7 @@ async fn ws_handler(
                         Some("config.apply") => {
                             let params = req.params.unwrap_or(serde_json::json!({}));
                             let raw = params.get("raw").and_then(|v| v.as_str());
-                            
+
                             if let Some(raw_content) = raw {
                                 let mut config_guard = state.config.write().await;
                                 if let Some(config) = config_guard.as_mut() {
@@ -904,7 +905,7 @@ async fn ws_handler(
                                         let mut hasher = Sha256::new();
                                         hasher.update(current_raw.as_bytes());
                                         let current_hash = format!("{:x}", hasher.finalize());
-                                        
+
                                         if current_hash != expected_hash {
                                             serde_json::json!({
                                                 "type": "res",
@@ -962,7 +963,7 @@ async fn ws_handler(
                         Some("config.patch") => {
                             let params = req.params.unwrap_or(serde_json::json!({}));
                             let raw = params.get("raw").and_then(|v| v.as_str());
-                            
+
                             if let Some(raw_content) = raw {
                                 let mut config_guard = state.config.write().await;
                                 if let Some(config) = config_guard.as_mut() {
@@ -1170,7 +1171,7 @@ async fn ws_handler(
                                 "type": "res",
                                 "id": req.id,
                                 "ok": true,
-                                "payload": { 
+                                "payload": {
                                     "totalCost": 0,
                                     "totalTokens": 0,
                                     "daily": [],
@@ -1217,21 +1218,21 @@ async fn ws_handler(
                         Some("chat.send") => {
                             let params = req.params.unwrap_or(serde_json::json!({}));
                             let message = params.get("message").and_then(|v| v.as_str()).unwrap_or("");
-                            
+
                             let tenant_id = params.get("tenant_id").or(params.get("session")).and_then(|v| v.as_str()).unwrap_or("default");
                             tracing::info!(tenant_id = tenant_id, message = message, "chat.send received");
-                            
+
                             let run_id = format!("run_{}", Uuid::new_v4().to_string().replace("-", "")[..8].to_string());
-                            
+
                             match Config::load_or_init().await {
                                 Ok(mut config) => {
                                     let tenant_workspace = config.workspace_dir.join(tenant_id);
                                     config.workspace_dir = tenant_workspace;
-                                    
+
                                     if let Err(e) = tokio::fs::create_dir_all(&config.workspace_dir).await {
                                         tracing::warn!(workspace = %config.workspace_dir.display(), error = %e, "Failed to create tenant workspace directory");
                                     }
-                                    
+
                                     match crate::agent::loop_::run(
                                         config,
                                         Some(message.to_string()),
@@ -1239,6 +1240,7 @@ async fn ws_handler(
                                         None,
                                         0.7,
                                         vec![],
+                                        false,
                                     ).await {
                                         Ok(response) => {
                                             let now = Utc::now().timestamp_millis();
@@ -1255,7 +1257,7 @@ async fn ws_handler(
                                                     timestamp: now + 1,
                                                 });
                                             }
-                                            
+
                                             let _ = send.send(ws::Message::Text(
                                                 serde_json::json!({
                                                     "type": "event",
@@ -1267,7 +1269,7 @@ async fn ws_handler(
                                                     }
                                                 }).to_string().into()
                                             )).await;
-                                            
+
                                             serde_json::json!({
                                                 "type": "res",
                                                 "id": req.id,
@@ -1311,7 +1313,7 @@ async fn ws_handler(
                                 "type": "res",
                                 "id": req.id,
                                 "ok": true,
-                                "payload": { 
+                                "payload": {
                                     "methods": [
                                         "agents.list", "chat.history", "chat.send", "chat.abort",
                                         "sessions.list", "sessions.patch", "sessions.delete",
@@ -1341,7 +1343,7 @@ async fn ws_handler(
                             })
                         }
                     };
-                    
+
                     let _ = send.send(ws::Message::Text(response.to_string().into())).await;
                 }
             }

@@ -62,6 +62,9 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
+    /// Multi-tenant workspace base directory (tenant-specific workspaces are under this)
+    #[serde(default)]
+    pub workspace_base: Option<PathBuf>,
     /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
     pub workspace_dir: PathBuf,
@@ -3380,6 +3383,7 @@ impl Default for Config {
         let zeroclaw_dir = home.join(".zeroclaw");
 
         Self {
+            workspace_base: None,
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,

@@ -1055,6 +1055,7 @@ impl SecurityPolicy {
             workspace_dir: workspace_dir.to_path_buf(),
             workspace_only: autonomy_config.workspace_only,
             allowed_commands: autonomy_config.allowed_commands.clone(),
+            forbidden_commands: vec![],
             forbidden_paths: autonomy_config.forbidden_paths.clone(),
             allowed_roots: autonomy_config
                 .allowed_roots
