@@ -1,6 +1,6 @@
 use crate::config::traits::ChannelConfig;
 use crate::providers::{is_glm_alias, is_zai_alias};
-use crate::security::AutonomyLevel;
+use crate::security::{AutonomyLevel, DomainMatcher};
 use anyhow::{Context, Result};
 use directories::UserDirs;
 use schemars::JsonSchema;
@@ -39,10 +39,17 @@ const SUPPORTED_PROXY_SERVICE_KEYS: &[&str] = &[
     "tool.pushover",
     "memory.embeddings",
     "tunnel.custom",
+    "transcription.groq",
 ];
 
-const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] =
-    &["provider.*", "channel.*", "tool.*", "memory.*", "tunnel.*"];
+const SUPPORTED_PROXY_SERVICE_SELECTORS: &[&str] = &[
+    "provider.*",
+    "channel.*",
+    "tool.*",
+    "memory.*",
+    "tunnel.*",
+    "transcription.*",
+];
 
 static RUNTIME_PROXY_CONFIG: OnceLock<RwLock<ProxyConfig>> = OnceLock::new();
 static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Client>>> =
@@ -55,8 +62,7 @@ static RUNTIME_PROXY_CLIENT_CACHE: OnceLock<RwLock<HashMap<String, reqwest::Clie
 /// Resolution order: `ZEROCLAW_WORKSPACE` env → `active_workspace.toml` marker → `~/.zeroclaw/config.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Config {
-    #[serde(default)]
-    pub workspace_base: Option<PathBuf>,
+    /// Workspace directory - computed from home, not serialized
     #[serde(skip)]
     pub workspace_dir: PathBuf,
     /// Path to config.toml - computed from home, not serialized
@@ -80,6 +86,10 @@ pub struct Config {
     /// Autonomy and security policy configuration (`[autonomy]`).
     #[serde(default)]
     pub autonomy: AutonomyConfig,
+
+    /// Security subsystem configuration (`[security]`).
+    #[serde(default)]
+    pub security: SecurityConfig,
 
     /// Runtime adapter configuration (`[runtime]`). Controls native vs Docker execution.
     #[serde(default)]
@@ -153,13 +163,6 @@ pub struct Config {
     #[serde(default)]
     pub browser: BrowserConfig,
 
-    /// Hooks configuration (lifecycle hooks and built-in hook toggles).
-    #[serde(default)]
-    pub hooks: HooksConfig,
-    /// Voice transcription configuration (Whisper API via Groq).
-    #[serde(default)]
-    pub transcription: TranscriptionConfig,
-
     /// HTTP request tool configuration (`[http_request]`).
     #[serde(default)]
     pub http_request: HttpRequestConfig,
@@ -192,9 +195,17 @@ pub struct Config {
     #[serde(default)]
     pub agents: HashMap<String, DelegateAgentConfig>,
 
+    /// Hooks configuration (lifecycle hooks and built-in hook toggles).
+    #[serde(default)]
+    pub hooks: HooksConfig,
+
     /// Hardware configuration (wizard-driven physical world setup).
     #[serde(default)]
     pub hardware: HardwareConfig,
+
+    /// Voice transcription configuration (Whisper API via Groq).
+    #[serde(default)]
+    pub transcription: TranscriptionConfig,
 }
 
 // ── Delegate Agents ──────────────────────────────────────────────
@@ -303,6 +314,52 @@ impl Default for HardwareConfig {
             baud_rate: default_baud_rate(),
             probe_target: None,
             workspace_datasheets: false,
+        }
+    }
+}
+
+// ── Transcription ────────────────────────────────────────────────
+
+fn default_transcription_api_url() -> String {
+    "https://api.groq.com/openai/v1/audio/transcriptions".into()
+}
+
+fn default_transcription_model() -> String {
+    "whisper-large-v3-turbo".into()
+}
+
+fn default_transcription_max_duration_secs() -> u64 {
+    120
+}
+
+/// Voice transcription configuration (Whisper API via Groq).
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct TranscriptionConfig {
+    /// Enable voice transcription for channels that support it.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whisper API endpoint URL.
+    #[serde(default = "default_transcription_api_url")]
+    pub api_url: String,
+    /// Whisper model name.
+    #[serde(default = "default_transcription_model")]
+    pub model: String,
+    /// Optional language hint (ISO-639-1, e.g. "en", "ru").
+    #[serde(default)]
+    pub language: Option<String>,
+    /// Maximum voice duration in seconds (messages longer than this are skipped).
+    #[serde(default = "default_transcription_max_duration_secs")]
+    pub max_duration_secs: u64,
+}
+
+impl Default for TranscriptionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            api_url: default_transcription_api_url(),
+            model: default_transcription_model(),
+            language: None,
+            max_duration_secs: default_transcription_max_duration_secs(),
         }
     }
 }
@@ -675,7 +732,7 @@ impl Default for PeripheralBoardConfig {
 /// Controls the HTTP gateway for webhook and pairing endpoints.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct GatewayConfig {
-    /// Gateway port (default: 3000)
+    /// Gateway port (default: 42617)
     #[serde(default = "default_gateway_port")]
     pub port: u16,
     /// Gateway host (default: 127.0.0.1)
@@ -718,7 +775,7 @@ pub struct GatewayConfig {
 }
 
 fn default_gateway_port() -> u16 {
-    3000
+    42617
 }
 
 fn default_gateway_host() -> String {
@@ -867,74 +924,6 @@ impl Default for BrowserComputerUseConfig {
     }
 }
 
-fn default_transcription_api_url() -> String {
-    "https://api.groq.com/openai/v1/audio/transcriptions".into()
-}
-
-fn default_transcription_model() -> String {
-    "whisper-large-v3".into()
-}
-
-fn default_transcription_max_duration_secs() -> u64 {
-    120
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[serde(rename_all = "kebab-case")]
-pub struct TranscriptionConfig {
-    #[serde(default)]
-    pub enabled: bool,
-    #[serde(default = "default_transcription_api_url")]
-    pub api_url: String,
-    #[serde(default = "default_transcription_model")]
-    pub model: String,
-    #[serde(default)]
-    pub language: Option<String>,
-    #[serde(default = "default_transcription_max_duration_secs")]
-    pub max_duration_secs: u64,
-}
-
-impl Default for TranscriptionConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            api_url: default_transcription_api_url(),
-            model: default_transcription_model(),
-            language: None,
-            max_duration_secs: default_transcription_max_duration_secs(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct HooksConfig {
-    pub enabled: bool,
-    #[serde(default)]
-    pub builtin: BuiltinHooksConfig,
-}
-
-impl Default for HooksConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            builtin: BuiltinHooksConfig::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct BuiltinHooksConfig {
-    pub command_logger: bool,
-}
-
-impl Default for BuiltinHooksConfig {
-    fn default() -> Self {
-        Self {
-            command_logger: false,
-        }
-    }
-}
-
 /// Browser automation configuration (`[browser]` section).
 ///
 /// Controls the `browser_open` tool and browser automation backends.
@@ -994,7 +983,7 @@ impl Default for BrowserConfig {
 /// HTTP request tool configuration (`[http_request]` section).
 ///
 /// Deny-by-default: if `allowed_domains` is empty, all HTTP requests are rejected.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct HttpRequestConfig {
     /// Enable `http_request` tool for API interactions
     #[serde(default)]
@@ -1008,6 +997,17 @@ pub struct HttpRequestConfig {
     /// Request timeout in seconds (default: 30)
     #[serde(default = "default_http_timeout_secs")]
     pub timeout_secs: u64,
+}
+
+impl Default for HttpRequestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allowed_domains: vec![],
+            max_response_size: default_http_max_response_size(),
+            timeout_secs: default_http_timeout_secs(),
+        }
+    }
 }
 
 fn default_http_max_response_size() -> usize {
@@ -1773,7 +1773,7 @@ pub struct ObservabilityConfig {
     #[serde(default = "default_runtime_trace_path")]
     pub runtime_trace_path: String,
 
-    /// Maximum number of runtime trace entries to retain in rolling mode.
+    /// Maximum entries retained when runtime_trace_mode = "rolling".
     #[serde(default = "default_runtime_trace_max_entries")]
     pub runtime_trace_max_entries: usize,
 }
@@ -1792,15 +1792,51 @@ impl Default for ObservabilityConfig {
 }
 
 fn default_runtime_trace_mode() -> String {
-    "none".into()
+    "none".to_string()
 }
 
 fn default_runtime_trace_path() -> String {
-    "runtime_trace.jsonl".into()
+    "state/runtime-trace.jsonl".to_string()
 }
 
 fn default_runtime_trace_max_entries() -> usize {
-    1000
+    200
+}
+
+// ── Hooks ────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HooksConfig {
+    /// Enable lifecycle hook execution.
+    ///
+    /// Hooks run in-process with the same privileges as the main runtime.
+    /// Keep enabled hook handlers narrowly scoped and auditable.
+    pub enabled: bool,
+    #[serde(default)]
+    pub builtin: BuiltinHooksConfig,
+}
+
+impl Default for HooksConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            builtin: BuiltinHooksConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BuiltinHooksConfig {
+    /// Enable the command-logger hook (logs tool calls for auditing).
+    pub command_logger: bool,
+}
+
+impl Default for BuiltinHooksConfig {
+    fn default() -> Self {
+        Self {
+            command_logger: false,
+        }
+    }
 }
 
 // ── Autonomy / Security ──────────────────────────────────────────
@@ -1813,13 +1849,12 @@ fn default_runtime_trace_max_entries() -> usize {
 pub struct AutonomyConfig {
     /// Autonomy level: `read_only`, `supervised` (default), or `full`.
     pub level: AutonomyLevel,
-    /// Restrict file writes and command paths to the workspace directory. Default: `true`.
+    /// Restrict absolute filesystem paths to workspace-relative references. Default: `true`.
+    /// Resolved paths outside the workspace still require `allowed_roots`.
     pub workspace_only: bool,
     /// Allowlist of executable names permitted for shell execution.
     pub allowed_commands: Vec<String>,
-    /// Explicit command denylist. Blocks these commands regardless of autonomy level.
-    pub forbidden_commands: Vec<String>,
-    /// Explicit path denylist. Default includes system-critical paths.
+    /// Explicit path denylist. Default includes system-critical paths and sensitive dotdirs.
     pub forbidden_paths: Vec<String>,
     /// Maximum actions allowed per hour per policy. Default: `100`.
     pub max_actions_per_hour: u32,
@@ -1835,6 +1870,9 @@ pub struct AutonomyConfig {
     pub block_high_risk_commands: bool,
 
     /// Additional environment variables allowed for shell tool subprocesses.
+    ///
+    /// These names are explicitly allowlisted and merged with the built-in safe
+    /// baseline (`PATH`, `HOME`, etc.) after `env_clear()`.
     #[serde(default)]
     pub shell_env_passthrough: Vec<String>,
 
@@ -1847,10 +1885,15 @@ pub struct AutonomyConfig {
     pub always_ask: Vec<String>,
 
     /// Extra directory roots the agent may read/write outside the workspace.
+    /// Supports absolute, `~/...`, and workspace-relative entries.
+    /// Resolved paths under any of these roots pass `is_resolved_path_allowed`.
     #[serde(default)]
     pub allowed_roots: Vec<String>,
 
-    /// Tools to exclude from non-CLI channels.
+    /// Tools to exclude from non-CLI channels (e.g. Telegram, Discord).
+    ///
+    /// When a tool is listed here, non-CLI channels will not expose it to the
+    /// model in tool specs.
     #[serde(default)]
     pub non_cli_excluded_tools: Vec<String>,
 }
@@ -1861,6 +1904,15 @@ fn default_auto_approve() -> Vec<String> {
 
 fn default_always_ask() -> Vec<String> {
     vec![]
+}
+
+fn is_valid_env_var_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(first) if first.is_ascii_alphabetic() || first == '_' => {}
+        _ => return false,
+    }
+    chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
 impl Default for AutonomyConfig {
@@ -1881,31 +1933,7 @@ impl Default for AutonomyConfig {
                 "wc".into(),
                 "head".into(),
                 "tail".into(),
-            ],
-            forbidden_commands: vec![
-                "rm -rf".into(),
-                "mkfs".into(),
-                "dd".into(),
-                "shutdown".into(),
-                "reboot".into(),
-                "halt".into(),
-                "poweroff".into(),
-                "docker".into(),
-                "kubectl".into(),
-                "mount".into(),
-                "umount".into(),
-                "chroot".into(),
-                "iptables".into(),
-                "ufw".into(),
-                "firewall-cmd".into(),
-                "sudo".into(),
-                "su".into(),
-                "passwd".into(),
-                "useradd".into(),
-                "userdel".into(),
-                "usermod".into(),
-                "groupadd".into(),
-                "groupdel".into(),
+                "date".into(),
             ],
             forbidden_paths: vec![
                 "/etc".into(),
@@ -1931,7 +1959,7 @@ impl Default for AutonomyConfig {
             max_cost_per_day_cents: 500,
             require_approval_for_medium_risk: true,
             block_high_risk_commands: true,
-            shell_env_passthrough: Vec::new(),
+            shell_env_passthrough: vec![],
             auto_approve: default_auto_approve(),
             always_ask: default_always_ask(),
             allowed_roots: Vec::new(),
@@ -2439,7 +2467,6 @@ pub struct ChannelsConfig {
     pub message_timeout_secs: u64,
 }
 
-
 impl ChannelsConfig {
     /// get channels' metadata and `.is_some()`, except webhook
     #[rustfmt::skip]
@@ -2641,6 +2668,7 @@ pub struct SlackConfig {
     /// Slack app-level token for Socket Mode (xapp-...).
     pub app_token: Option<String>,
     /// Optional channel ID to restrict the bot to a single channel.
+    /// Omit (or set `"*"`) to listen across all accessible channels.
     pub channel_id: Option<String>,
     /// Allowed Slack user IDs. Empty = deny all.
     #[serde(default)]
@@ -3016,6 +3044,123 @@ pub struct SecurityConfig {
     /// Audit logging configuration
     #[serde(default)]
     pub audit: AuditConfig,
+
+    /// OTP gating configuration for sensitive actions/domains.
+    #[serde(default)]
+    pub otp: OtpConfig,
+
+    /// Emergency-stop state machine configuration.
+    #[serde(default)]
+    pub estop: EstopConfig,
+}
+
+/// OTP validation strategy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum OtpMethod {
+    /// Time-based one-time password (RFC 6238).
+    #[default]
+    Totp,
+    /// Future method for paired-device confirmations.
+    Pairing,
+    /// Future method for local CLI challenge prompts.
+    CliPrompt,
+}
+
+/// Security OTP configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct OtpConfig {
+    /// Enable OTP gating. Defaults to disabled for backward compatibility.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// OTP method.
+    #[serde(default)]
+    pub method: OtpMethod,
+
+    /// TOTP time-step in seconds.
+    #[serde(default = "default_otp_token_ttl_secs")]
+    pub token_ttl_secs: u64,
+
+    /// Reuse window for recently validated OTP codes.
+    #[serde(default = "default_otp_cache_valid_secs")]
+    pub cache_valid_secs: u64,
+
+    /// Tool/action names gated by OTP.
+    #[serde(default = "default_otp_gated_actions")]
+    pub gated_actions: Vec<String>,
+
+    /// Explicit domain patterns gated by OTP.
+    #[serde(default)]
+    pub gated_domains: Vec<String>,
+
+    /// Domain-category presets expanded into `gated_domains`.
+    #[serde(default)]
+    pub gated_domain_categories: Vec<String>,
+}
+
+fn default_otp_token_ttl_secs() -> u64 {
+    30
+}
+
+fn default_otp_cache_valid_secs() -> u64 {
+    300
+}
+
+fn default_otp_gated_actions() -> Vec<String> {
+    vec![
+        "shell".to_string(),
+        "file_write".to_string(),
+        "browser_open".to_string(),
+        "browser".to_string(),
+        "memory_forget".to_string(),
+    ]
+}
+
+impl Default for OtpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            method: OtpMethod::Totp,
+            token_ttl_secs: default_otp_token_ttl_secs(),
+            cache_valid_secs: default_otp_cache_valid_secs(),
+            gated_actions: default_otp_gated_actions(),
+            gated_domains: Vec::new(),
+            gated_domain_categories: Vec::new(),
+        }
+    }
+}
+
+/// Emergency stop configuration.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct EstopConfig {
+    /// Enable emergency stop controls.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// File path used to persist estop state.
+    #[serde(default = "default_estop_state_file")]
+    pub state_file: String,
+
+    /// Require a valid OTP before resume operations.
+    #[serde(default = "default_true")]
+    pub require_otp_to_resume: bool,
+}
+
+fn default_estop_state_file() -> String {
+    "~/.zeroclaw/estop-state.json".to_string()
+}
+
+impl Default for EstopConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            state_file: default_estop_state_file(),
+            require_otp_to_resume: true,
+        }
+    }
 }
 
 /// Sandbox configuration for OS-level isolation
@@ -3235,7 +3380,6 @@ impl Default for Config {
         let zeroclaw_dir = home.join(".zeroclaw");
 
         Self {
-            workspace_base: None,
             workspace_dir: zeroclaw_dir.join("workspace"),
             config_path: zeroclaw_dir.join("config.toml"),
             api_key: None,
@@ -3245,6 +3389,7 @@ impl Default for Config {
             default_temperature: 0.7,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -3270,9 +3415,9 @@ impl Default for Config {
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
             query_classification: QueryClassificationConfig::default(),
-            hooks: HooksConfig::default(),
             transcription: TranscriptionConfig::default(),
         }
     }
@@ -3403,7 +3548,7 @@ pub(crate) async fn persist_active_workspace_config_dir(config_dir: &Path) -> Re
     Ok(())
 }
 
-pub fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
+pub(crate) fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathBuf) {
     let workspace_config_dir = workspace_dir.to_path_buf();
     if workspace_config_dir.join("config.toml").exists() {
         return (
@@ -3432,6 +3577,17 @@ pub fn resolve_config_dir_for_workspace(workspace_dir: &Path) -> (PathBuf, PathB
         workspace_config_dir.clone(),
         workspace_config_dir.join("workspace"),
     )
+}
+
+/// Resolve the current runtime config/workspace directories for onboarding flows.
+///
+/// This mirrors the same precedence used by `Config::load_or_init()`:
+/// `ZEROCLAW_CONFIG_DIR` > `ZEROCLAW_WORKSPACE` > active workspace marker > defaults.
+pub(crate) async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
+    let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
+    let (config_dir, workspace_dir, _) =
+        resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
+    Ok((config_dir, workspace_dir))
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3498,22 +3654,6 @@ async fn resolve_runtime_config_dirs(
     ))
 }
 
-pub async fn resolve_runtime_dirs_for_onboarding() -> Result<(PathBuf, PathBuf)> {
-    let default_zeroclaw_dir = UserDirs::new()
-        .and_then(|dirs| dirs.home_dir().join(".zeroclaw").into_os_string().into())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".zeroclaw"));
-
-    let default_workspace_dir = default_zeroclaw_dir.join("workspace");
-
-    let (_, workspace_dir, _) =
-        resolve_runtime_config_dirs(&default_zeroclaw_dir, &default_workspace_dir).await?;
-
-    let (config_dir, _) = resolve_config_dir_for_workspace(&workspace_dir);
-
-    Ok((config_dir, workspace_dir))
-}
-
 fn decrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3531,6 +3671,19 @@ fn decrypt_optional_secret(
     Ok(())
 }
 
+fn decrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .decrypt(value)
+            .with_context(|| format!("Failed to decrypt {field_name}"))?;
+    }
+    Ok(())
+}
+
 fn encrypt_optional_secret(
     store: &crate::security::SecretStore,
     value: &mut Option<String>,
@@ -3544,6 +3697,19 @@ fn encrypt_optional_secret(
                     .with_context(|| format!("Failed to encrypt {field_name}"))?,
             );
         }
+    }
+    Ok(())
+}
+
+fn encrypt_secret(
+    store: &crate::security::SecretStore,
+    value: &mut String,
+    field_name: &str,
+) -> Result<()> {
+    if !crate::security::SecretStore::is_encrypted(value) {
+        *value = store
+            .encrypt(value)
+            .with_context(|| format!("Failed to encrypt {field_name}"))?;
     }
     Ok(())
 }
@@ -3585,13 +3751,6 @@ fn has_ollama_cloud_credential(config_api_key: Option<&str>) -> bool {
 }
 
 impl Config {
-    pub fn tenant_workspace_dir(&self, tenant_id: &str) -> PathBuf {
-        if let Some(ref base) = self.workspace_base {
-            return base.join(tenant_id);
-        }
-        self.workspace_dir.clone()
-    }
-
     pub async fn load_or_init() -> Result<Self> {
         let (default_zeroclaw_dir, default_workspace_dir) = default_config_and_workspace_dirs()?;
 
@@ -3662,6 +3821,15 @@ impl Config {
             for agent in config.agents.values_mut() {
                 decrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
             }
+
+            if let Some(ref mut ns) = config.channels_config.nostr {
+                decrypt_secret(
+                    &store,
+                    &mut ns.private_key,
+                    "config.channels_config.nostr.private_key",
+                )?;
+            }
+
             config.apply_env_overrides();
             config.validate()?;
             tracing::info!(
@@ -3711,6 +3879,50 @@ impl Config {
         // Autonomy
         if self.autonomy.max_actions_per_hour == 0 {
             anyhow::bail!("autonomy.max_actions_per_hour must be greater than 0");
+        }
+        for (i, env_name) in self.autonomy.shell_env_passthrough.iter().enumerate() {
+            if !is_valid_env_var_name(env_name) {
+                anyhow::bail!(
+                    "autonomy.shell_env_passthrough[{i}] is invalid ({env_name}); expected [A-Za-z_][A-Za-z0-9_]*"
+                );
+            }
+        }
+
+        // Security OTP / estop
+        if self.security.otp.token_ttl_secs == 0 {
+            anyhow::bail!("security.otp.token_ttl_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs == 0 {
+            anyhow::bail!("security.otp.cache_valid_secs must be greater than 0");
+        }
+        if self.security.otp.cache_valid_secs < self.security.otp.token_ttl_secs {
+            anyhow::bail!(
+                "security.otp.cache_valid_secs must be greater than or equal to security.otp.token_ttl_secs"
+            );
+        }
+        for (i, action) in self.security.otp.gated_actions.iter().enumerate() {
+            let normalized = action.trim();
+            if normalized.is_empty() {
+                anyhow::bail!("security.otp.gated_actions[{i}] must not be empty");
+            }
+            if !normalized
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+            {
+                anyhow::bail!(
+                    "security.otp.gated_actions[{i}] contains invalid characters: {normalized}"
+                );
+            }
+        }
+        DomainMatcher::new(
+            &self.security.otp.gated_domains,
+            &self.security.otp.gated_domain_categories,
+        )
+        .with_context(|| {
+            "Invalid security.otp.gated_domains or security.otp.gated_domain_categories"
+        })?;
+        if self.security.estop.state_file.trim().is_empty() {
+            anyhow::bail!("security.estop.state_file must not be empty");
         }
 
         // Scheduler
@@ -4095,6 +4307,14 @@ impl Config {
             encrypt_optional_secret(&store, &mut agent.api_key, "config.agents.*.api_key")?;
         }
 
+        if let Some(ref mut ns) = config_to_save.channels_config.nostr {
+            encrypt_secret(
+                &store,
+                &mut ns.private_key,
+                "config.channels_config.nostr.private_key",
+            )?;
+        }
+
         let toml_str =
             toml::to_string_pretty(&config_to_save).context("Failed to serialize config")?;
 
@@ -4204,6 +4424,15 @@ mod tests {
     // ── Defaults ─────────────────────────────────────────────
 
     #[test]
+    async fn http_request_config_default_has_correct_values() {
+        let cfg = HttpRequestConfig::default();
+        assert_eq!(cfg.timeout_secs, 30);
+        assert_eq!(cfg.max_response_size, 1_000_000);
+        assert!(!cfg.enabled);
+        assert!(cfg.allowed_domains.is_empty());
+    }
+
+    #[test]
     async fn config_default_has_sane_values() {
         let c = Config::default();
         assert_eq!(c.default_provider.as_deref(), Some("openrouter"));
@@ -4264,6 +4493,9 @@ mod tests {
     async fn observability_config_default() {
         let o = ObservabilityConfig::default();
         assert_eq!(o.backend, "none");
+        assert_eq!(o.runtime_trace_mode, "none");
+        assert_eq!(o.runtime_trace_path, "state/runtime-trace.jsonl");
+        assert_eq!(o.runtime_trace_max_entries, 200);
     }
 
     #[test]
@@ -4278,6 +4510,7 @@ mod tests {
         assert_eq!(a.max_cost_per_day_cents, 500);
         assert!(a.require_approval_for_medium_risk);
         assert!(a.block_high_risk_commands);
+        assert!(a.shell_env_passthrough.is_empty());
     }
 
     #[test]
@@ -4366,7 +4599,6 @@ default_temperature = 0.7
     #[test]
     async fn config_toml_roundtrip() {
         let config = Config {
-            workspace_base: None,
             workspace_dir: PathBuf::from("/tmp/test/workspace"),
             config_path: PathBuf::from("/tmp/test/config.toml"),
             api_key: Some("sk-test-key".into()),
@@ -4387,10 +4619,13 @@ default_temperature = 0.7
                 max_cost_per_day_cents: 1000,
                 require_approval_for_medium_risk: false,
                 block_high_risk_commands: true,
+                shell_env_passthrough: vec!["DATABASE_URL".into()],
                 auto_approve: vec!["file_read".into()],
                 always_ask: vec![],
-                ..Default::default()
+                allowed_roots: vec![],
+                non_cli_excluded_tools: vec![],
             },
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig {
                 kind: "docker".into(),
                 ..RuntimeConfig::default()
@@ -4431,6 +4666,8 @@ default_temperature = 0.7
                 lark: None,
                 dingtalk: None,
                 qq: None,
+                nostr: None,
+                clawdtalk: None,
                 message_timeout_secs: 300,
             },
             memory: MemoryConfig::default(),
@@ -4449,7 +4686,9 @@ default_temperature = 0.7
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         let toml_str = toml::to_string_pretty(&config).unwrap();
@@ -4460,6 +4699,7 @@ default_temperature = 0.7
         assert_eq!(parsed.default_model, config.default_model);
         assert!((parsed.default_temperature - config.default_temperature).abs() < f64::EPSILON);
         assert_eq!(parsed.observability.backend, "log");
+        assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Full);
         assert!(!parsed.autonomy.workspace_only);
         assert_eq!(parsed.runtime.kind, "docker");
@@ -4483,6 +4723,7 @@ default_temperature = 0.7
         assert!(parsed.api_key.is_none());
         assert!(parsed.default_provider.is_none());
         assert_eq!(parsed.observability.backend, "none");
+        assert_eq!(parsed.observability.runtime_trace_mode, "none");
         assert_eq!(parsed.autonomy.level, AutonomyLevel::Supervised);
         assert_eq!(parsed.runtime.kind, "native");
         assert!(!parsed.heartbeat.enabled);
@@ -4583,7 +4824,6 @@ tool_dispatcher = "xml"
 
         let config_path = dir.join("config.toml");
         let config = Config {
-            workspace_base: None,
             workspace_dir: dir.join("workspace"),
             config_path: config_path.clone(),
             api_key: Some("sk-roundtrip".into()),
@@ -4593,6 +4833,7 @@ tool_dispatcher = "xml"
             default_temperature: 0.9,
             observability: ObservabilityConfig::default(),
             autonomy: AutonomyConfig::default(),
+            security: SecurityConfig::default(),
             runtime: RuntimeConfig::default(),
             reliability: ReliabilityConfig::default(),
             scheduler: SchedulerConfig::default(),
@@ -4619,7 +4860,9 @@ tool_dispatcher = "xml"
             cost: CostConfig::default(),
             peripherals: PeripheralsConfig::default(),
             agents: HashMap::new(),
+            hooks: HooksConfig::default(),
             hardware: HardwareConfig::default(),
+            transcription: TranscriptionConfig::default(),
         };
 
         config.save().await.unwrap();
@@ -4976,6 +5219,8 @@ allowed_users = ["@ops:matrix.org"]
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -5186,6 +5431,8 @@ channel_id = "C123"
             lark: None,
             dingtalk: None,
             qq: None,
+            nostr: None,
+            clawdtalk: None,
             message_timeout_secs: 300,
         };
         let toml_str = toml::to_string_pretty(&c).unwrap();
@@ -5260,7 +5507,7 @@ channel_id = "C123"
     #[test]
     async fn checklist_gateway_serde_roundtrip() {
         let g = GatewayConfig {
-            port: 3000,
+            port: 42617,
             host: "127.0.0.1".into(),
             require_pairing: true,
             allow_public_bind: false,
@@ -6089,7 +6336,7 @@ default_model = "legacy-model"
     async fn env_override_gateway_port() {
         let _env_guard = env_override_lock().await;
         let mut config = Config::default();
-        assert_eq!(config.gateway.port, 3000);
+        assert_eq!(config.gateway.port, 42617);
 
         std::env::set_var("ZEROCLAW_GATEWAY_PORT", "8080");
         config.apply_env_overrides();
@@ -6411,7 +6658,7 @@ default_model = "legacy-model"
     #[test]
     async fn gateway_config_default_values() {
         let g = GatewayConfig::default();
-        assert_eq!(g.port, 3000);
+        assert_eq!(g.port, 42617);
         assert_eq!(g.host, "127.0.0.1");
         assert!(g.require_pairing);
         assert!(!g.allow_public_bind);
@@ -6596,5 +6843,121 @@ default_model = "legacy-model"
             mode & 0o004 != 0,
             "Test setup: file should be world-readable (mode {mode:o})"
         );
+    }
+
+    #[test]
+    async fn transcription_config_defaults() {
+        let tc = TranscriptionConfig::default();
+        assert!(!tc.enabled);
+        assert!(tc.api_url.contains("groq.com"));
+        assert_eq!(tc.model, "whisper-large-v3-turbo");
+        assert!(tc.language.is_none());
+        assert_eq!(tc.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn config_roundtrip_with_transcription() {
+        let mut config = Config::default();
+        config.transcription.enabled = true;
+        config.transcription.language = Some("en".into());
+
+        let toml_str = toml::to_string_pretty(&config).unwrap();
+        let parsed: Config = toml::from_str(&toml_str).unwrap();
+
+        assert!(parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.language.as_deref(), Some("en"));
+        assert_eq!(parsed.transcription.model, "whisper-large-v3-turbo");
+    }
+
+    #[test]
+    async fn config_without_transcription_uses_defaults() {
+        let toml_str = r#"
+            default_provider = "openrouter"
+            default_model = "test-model"
+            default_temperature = 0.7
+        "#;
+        let parsed: Config = toml::from_str(toml_str).unwrap();
+        assert!(!parsed.transcription.enabled);
+        assert_eq!(parsed.transcription.max_duration_secs, 120);
+    }
+
+    #[test]
+    async fn security_defaults_are_backward_compatible() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+"#,
+        )
+        .unwrap();
+
+        assert!(!parsed.security.otp.enabled);
+        assert_eq!(parsed.security.otp.method, OtpMethod::Totp);
+        assert!(!parsed.security.estop.enabled);
+        assert!(parsed.security.estop.require_otp_to_resume);
+    }
+
+    #[test]
+    async fn security_toml_parses_otp_and_estop_sections() {
+        let parsed: Config = toml::from_str(
+            r#"
+default_provider = "openrouter"
+default_model = "anthropic/claude-sonnet-4.6"
+default_temperature = 0.7
+
+[security.otp]
+enabled = true
+method = "totp"
+token_ttl_secs = 30
+cache_valid_secs = 120
+gated_actions = ["shell", "browser_open"]
+gated_domains = ["*.chase.com", "accounts.google.com"]
+gated_domain_categories = ["banking"]
+
+[security.estop]
+enabled = true
+state_file = "~/.zeroclaw/estop-state.json"
+require_otp_to_resume = true
+"#,
+        )
+        .unwrap();
+
+        assert!(parsed.security.otp.enabled);
+        assert!(parsed.security.estop.enabled);
+        assert_eq!(parsed.security.otp.gated_actions.len(), 2);
+        assert_eq!(parsed.security.otp.gated_domains.len(), 2);
+        parsed.validate().unwrap();
+    }
+
+    #[test]
+    async fn security_validation_rejects_invalid_domain_glob() {
+        let mut config = Config::default();
+        config.security.otp.gated_domains = vec!["bad domain.com".into()];
+
+        let err = config.validate().expect_err("expected invalid domain glob");
+        assert!(err.to_string().contains("gated_domains"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_unknown_domain_category() {
+        let mut config = Config::default();
+        config.security.otp.gated_domain_categories = vec!["not_real".into()];
+
+        let err = config
+            .validate()
+            .expect_err("expected unknown domain category");
+        assert!(err.to_string().contains("gated_domain_categories"));
+    }
+
+    #[test]
+    async fn security_validation_rejects_zero_token_ttl() {
+        let mut config = Config::default();
+        config.security.otp.token_ttl_secs = 0;
+
+        let err = config
+            .validate()
+            .expect_err("expected ttl validation failure");
+        assert!(err.to_string().contains("token_ttl_secs"));
     }
 }

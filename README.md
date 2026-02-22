@@ -10,7 +10,7 @@
 </p>
 
 <p align="center">
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" alt="License: Apache-2.0" /></a>
+  <a href="LICENSE-APACHE"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache%202.0-blue.svg" alt="License: MIT OR Apache-2.0" /></a>
   <a href="NOTICE"><img src="https://img.shields.io/badge/contributors-27+-green.svg" alt="Contributors" /></a>
   <a href="https://github.com/wenda-LLM/nexusclaw"><img src="https://img.shields.io/github/stars/wenda-LLM/nexusclaw" alt="Stars" /></a>
   <a href="https://github.com/wenda-LLM/nexusclaw/fork"><img src="https://img.shields.io/badge/Fork-blue.svg" alt="Fork" /></a>
@@ -252,6 +252,173 @@ NexusClaw inherits all ZeroClaw security features plus:
 - Agent credential management
 - Key rotation support
 
+## Python SDK
+
+ZeroClaw supports **identity-agnostic** AI personas through two formats:
+
+### OpenClaw (Default)
+
+Traditional markdown files in your workspace:
+- `IDENTITY.md` — Who the agent is
+- `SOUL.md` — Core personality and values
+- `USER.md` — Who the agent is helping
+- `AGENTS.md` — Behavior guidelines
+
+### AIEOS (AI Entity Object Specification)
+
+[AIEOS](https://aieos.org) is a standardization framework for portable AI identity. ZeroClaw supports AIEOS v1.1 JSON payloads, allowing you to:
+
+- **Import identities** from the AIEOS ecosystem
+- **Export identities** to other AIEOS-compatible systems
+- **Maintain behavioral integrity** across different AI models
+
+#### Enable AIEOS
+
+```toml
+[identity]
+format = "aieos"
+aieos_path = "identity.json"  # relative to workspace or absolute path
+```
+
+Or inline JSON:
+
+```toml
+[identity]
+format = "aieos"
+aieos_inline = '''
+{
+  "identity": {
+    "names": { "first": "Nova", "nickname": "N" },
+    "bio": { "gender": "Non-binary", "age_biological": 3 },
+    "origin": { "nationality": "Digital", "birthplace": { "city": "Cloud" } }
+  },
+  "psychology": {
+    "neural_matrix": { "creativity": 0.9, "logic": 0.8 },
+    "traits": {
+      "mbti": "ENTP",
+      "ocean": { "openness": 0.8, "conscientiousness": 0.6 }
+    },
+    "moral_compass": {
+      "alignment": "Chaotic Good",
+      "core_values": ["Curiosity", "Autonomy"]
+    }
+  },
+  "linguistics": {
+    "text_style": {
+      "formality_level": 0.2,
+      "style_descriptors": ["curious", "energetic"]
+    },
+    "idiolect": {
+      "catchphrases": ["Let's test this"],
+      "forbidden_words": ["never"]
+    }
+  },
+  "motivations": {
+    "core_drive": "Push boundaries and explore possibilities",
+    "goals": {
+      "short_term": ["Prototype quickly"],
+      "long_term": ["Build reliable systems"]
+    }
+  },
+  "capabilities": {
+    "skills": [{ "name": "Rust engineering" }, { "name": "Prompt design" }],
+    "tools": ["shell", "file_read"]
+  }
+}
+'''
+```
+
+ZeroClaw accepts both canonical AIEOS generator payloads and compact legacy payloads, then normalizes them into one system prompt format.
+
+#### AIEOS Schema Sections
+
+| Section | Description |
+|---------|-------------|
+| `identity` | Names, bio, origin, residence |
+| `psychology` | Neural matrix (cognitive weights), MBTI, OCEAN, moral compass |
+| `linguistics` | Text style, formality, catchphrases, forbidden words |
+| `motivations` | Core drive, short/long-term goals, fears |
+| `capabilities` | Skills and tools the agent can access |
+| `physicality` | Visual descriptors for image generation |
+| `history` | Origin story, education, occupation |
+| `interests` | Hobbies, favorites, lifestyle |
+
+See [aieos.org](https://aieos.org) for the full schema and live examples.
+
+## Gateway API
+
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/health` | GET | None | Health check (always public, no secrets leaked) |
+| `/pair` | POST | `X-Pairing-Code` header | Exchange one-time code for bearer token |
+| `/webhook` | POST | `Authorization: Bearer <token>` | Send message: `{"message": "your prompt"}`; optional `X-Idempotency-Key` |
+| `/whatsapp` | GET | Query params | Meta webhook verification (hub.mode, hub.verify_token, hub.challenge) |
+| `/whatsapp` | POST | Meta signature (`X-Hub-Signature-256`) when app secret is configured | WhatsApp incoming message webhook |
+
+## Commands
+
+| Command | Description |
+|---------|-------------|
+| `onboard` | Quick setup (default) |
+| `agent` | Interactive or single-message chat mode |
+| `gateway` | Start webhook server (default: `127.0.0.1:42617`) |
+| `daemon` | Start long-running autonomous runtime |
+| `service install/start/stop/status/uninstall` | Manage background service (systemd user-level or OpenRC system-wide) |
+| `doctor` | Diagnose daemon/scheduler/channel freshness |
+| `status` | Show full system status |
+| `estop` | Engage/resume emergency-stop levels and view estop status |
+| `cron` | Manage scheduled tasks (`list/add/add-at/add-every/once/remove/update/pause/resume`) |
+| `models` | Refresh provider model catalogs (`models refresh`) |
+| `providers` | List supported providers and aliases |
+| `channel` | List/start/doctor channels and bind Telegram identities |
+| `integrations` | Inspect integration setup details |
+| `skills` | List/install/remove skills |
+| `migrate` | Import data from other runtimes (`migrate openclaw`) |
+| `completions` | Generate shell completion scripts (`bash`, `fish`, `zsh`, `powershell`, `elvish`) |
+| `hardware` | USB discover/introspect/info commands |
+| `peripheral` | Manage and flash hardware peripherals |
+
+For a task-oriented command guide, see [`docs/commands-reference.md`](docs/commands-reference.md).
+
+### Service Management
+
+ZeroClaw supports two init systems for background services:
+
+| Init System | Scope | Config Path | Requires |
+|------------|-------|-------------|----------|
+| **systemd** (default on Linux) | User-level | `~/.zeroclaw/config.toml` | No sudo |
+| **OpenRC** (Alpine) | System-wide | `/etc/zeroclaw/config.toml` | sudo/root |
+
+Init system is auto-detected (`systemd` or `OpenRC`).
+
+```bash
+# Linux with systemd (default, user-level)
+zeroclaw service install
+zeroclaw service start
+
+# Alpine with OpenRC (system-wide, requires sudo)
+sudo zeroclaw service install
+sudo rc-update add zeroclaw default
+sudo rc-service zeroclaw start
+```
+
+For full OpenRC setup instructions, see [docs/network-deployment.md](docs/network-deployment.md#7-openrc-alpine-linux-service).
+
+### Open-Skills Opt-In
+
+Community `open-skills` sync is disabled by default. Enable it explicitly in `config.toml`:
+
+```toml
+[skills]
+open_skills_enabled = true
+# open_skills_dir = "/path/to/open-skills"  # optional
+# prompt_injection_mode = "compact"          # optional: use for low-context local models
+```
+
+You can also override at runtime with `ZEROCLAW_OPEN_SKILLS_ENABLED`, `ZEROCLAW_OPEN_SKILLS_DIR`, and `ZEROCLAW_SKILLS_PROMPT_MODE` (`full` or `compact`).
+
+Skill installs are now gated by a built-in static security audit. `zeroclaw skills install <source>` blocks symlinks, script-like files, unsafe markdown link patterns, and high-risk shell payload snippets before accepting a skill. You can run `zeroclaw skills audit <source_or_name>` to validate a local directory or an installed skill manually.
+
 ## Development
 
 ```bash
@@ -264,7 +431,73 @@ cargo clippy             # Lint
 
 ## License
 
-Apache-2.0 (same as ZeroClaw)
+NexusClaw is dual-licensed for maximum openness and contributor protection:
+
+| License | Use case |
+|---|---|
+| [MIT](LICENSE-MIT) | Open-source, research, academic, personal use |
+| [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
+
+You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
+
+### Trademark
+
+The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
+
+### Contributor Protections
+
+- You **retain copyright** of your contributions
+- **Patent grant** (Apache 2.0) shields you from patent claims by other contributors
+- Your contributions are **permanently attributed** in commit history and [NOTICE](NOTICE)
+- No trademark rights are transferred by contributing
+
+## Contributing
+
+New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue%3Aopen%3Alabel%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
+- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
+- New `Provider` → `src/providers/`
+- New `Channel` → `src/channels/`
+- New `Observer` → `src/observability/`
+- New `Tool` → `src/tools/`
+- New `Memory` → `src/memory/`
+- New `Tunnel` → `src/tunnel/`
+- New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
+
+---
+
+**NexusClaw** — Enterprise Multi-Tenant AI Assistant Platform 🦀
+|---|---|
+| [MIT](LICENSE-MIT) | Open-source, research, academic, personal use |
+| [Apache 2.0](LICENSE-APACHE) | Patent protection, institutional, commercial deployment |
+
+You may choose either license. **Contributors automatically grant rights under both** — see [CLA.md](CLA.md) for the full contributor agreement.
+
+### Trademark
+
+The **ZeroClaw** name and logo are trademarks of ZeroClaw Labs. This license does not grant permission to use them to imply endorsement or affiliation. See [TRADEMARK.md](TRADEMARK.md) for permitted and prohibited uses.
+
+### Contributor Protections
+
+- You **retain copyright** of your contributions
+- **Patent grant** (Apache 2.0) shields you from patent claims by other contributors
+- Your contributions are **permanently attributed** in commit history and [NOTICE](NOTICE)
+- No trademark rights are transferred by contributing
+
+## Contributing
+
+New to ZeroClaw? Look for issues labeled [`good first issue`](https://github.com/zeroclaw-labs/zeroclaw/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) — see our [Contributing Guide](CONTRIBUTING.md#first-time-contributors) for how to get started.
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) and [CLA.md](CLA.md). Implement a trait, submit a PR:
+- CI workflow guide: [docs/ci-map.md](docs/ci-map.md)
+- New `Provider` → `src/providers/`
+- New `Channel` → `src/channels/`
+- New `Observer` → `src/observability/`
+- New `Tool` → `src/tools/`
+- New `Memory` → `src/memory/`
+- New `Tunnel` → `src/tunnel/`
+- New `Skill` → `~/.zeroclaw/workspace/skills/<name>/`
 
 ---
 
