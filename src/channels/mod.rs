@@ -1714,6 +1714,8 @@ async fn process_channel_message(
                 ctx.max_tool_iterations,
                 Some(cancellation_token.clone()),
                 delta_tx,
+                ctx.hooks.as_ref().map(|h| h.as_ref()),
+                ctx.non_cli_excluded_tools.as_slice(),
             ),
         ) => LlmExecutionResult::Completed(result),
     };
