@@ -1,58 +1,107 @@
-NexusClaw
-Copyright 2025 NexusClaw Contributors
+ZeroClaw
+Copyright 2025 ZeroClaw Labs
 
-This is an enterprise fork of ZeroClaw.
+This product includes software developed at ZeroClaw Labs (https://github.com/zeroclaw-labs).
 
-About
-=====
+Contributors
+============
 
-NexusClaw is an enterprise multi-tenant AI assistant platform built on ZeroClaw.
-It adds multi-tenant support, web-based management UI, enterprise vault, team management,
-container management, key rotation, and relay server capabilities.
+The following individuals have contributed to ZeroClaw:
 
-Official Repository
-===================
+- 781226451
+- Abdzsam
+- adie
+- adisusilayasa
+- agorevski
+- b4iterdev
+- Baz00k
+- beee003
+- beemaya003
+- BenedictKing
+- bowans
+- cbigger
+- cd-slash
+- cdalar
+- cesdperez
+- chenmi319
+- chumyin
+- cybershang
+- daniiiiekisde
+- darwin808
+- Death-Incarnate
+- diannaojiang
+- dwillitzer
+- ecschoye
+- elonfeng
+- Extreammouse
+- fettpl
+- FISHers6
+- ftonato
+- gh-xj
+- ghsmc
+- haeli05
+- hayoial
+- heaveless
+- hustshawn
+- ibhagwan
+- ikunali
+- InuDial
+- jaysonsantos
+- jbradf0rd
+- jereanon
+- junbaor
+- KevinZhao
+- klampatech
+- KNIGHTABDO
+- kumanday
+- kunwl123456
+- l15y
+- lawyered0
+- LiWeny16
+- Lumi-node
+- mackenzieclark
+- mai1015
+- Marlinski
+- Mgrsc
+- mikeboensel
+- mmacedoeu
+- Moeblack
+- nkhoit
+- NorbertBodziony
+- Paulo-21
+- pluginmd
+- radkrish
+- reidliu41
+- RinZ27
+- RocketRene
+- s04
+- sahajre
+- sammcj
+- stakeswky
+- Syeda-Anshrah-Gillani
+- theonlyhennygod
+- ttulttul
+- v0l
+- valmy
+- vernonstinebaker
+- vrescobar
+- vyahhi
+- willsarg
+- xero7689
+- xiaotianxt
+- yashmahe2020
+- yijunyu
+- yookoala
+- youhanasheriff
+- YubinghanBai
+- ZekiKod
+- zverozabr
 
-https://github.com/wenda-LLM/nexusclaw
-
-NexusClaw is based on ZeroClaw: https://github.com/zeroclaw-labs/zeroclaw
-
-License
-=======
-
-This software is available under a dual-license model:
-
-  1. MIT License — see LICENSE
-  2. Apache License 2.0 — see LICENSE-APACHE
-
-You may use either license. Contributors grant rights under both.
-See CLA.md for the contributor license agreement.
-
-Upstream Project (ZeroClaw)
-===========================
-
-ZeroClaw was originally developed by:
-- Argenis de la Rosa <theonlyhennygod@gmail.com>
-- ZeroClaw Contributors
-
-ZeroClaw is a Rust-first autonomous agent runtime optimized for high performance,
-high efficiency, high stability, high extensibility, high sustainability, and high security.
-
-NexusClaw Contributors
-======================
-
-This NOTICE file is maintained by repository automation.
-For the latest contributor list, see the repository contributors page:
-https://github.com/wenda-LLM/nexusclaw/graphs/contributors
-
-All contributors retain copyright ownership of their contributions.
-Contributions are permanently attributed in the repository commit history.
-Patent rights are protected for all contributors under Apache License 2.0.
 
 Third-Party Dependencies
-========================
+=========================
 
-This project uses third-party libraries and components,
-each licensed under their respective terms.
+This project uses the following third-party libraries and components,
+each licensed under their respective terms:
 
-See Cargo.lock for a complete dependency list with their respective licenses.
+See Cargo.lock for a complete list of dependencies and their licenses.
